@@ -21,7 +21,21 @@ DATETIME_COLS = ["利用日", "支払日"]
 def _use_supabase() -> bool:
     try:
         url = st.secrets.get("supabase", {}).get("url", "")
-        return url.startswith("https://") and "supabase.co" in url
+        if not (url.startswith("https://") and "supabase.co" in url):
+            return False
+        # 実際に接続できるか確認（キャッシュ済みの結果を使用）
+        return _supabase_available()
+    except Exception:
+        return False
+
+@st.cache_resource
+def _supabase_available() -> bool:
+    """Supabaseへの接続を試み、成功すればTrue"""
+    try:
+        from supabase import create_client
+        sb = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
+        sb.table("app_storage").select("key").limit(1).execute()
+        return True
     except Exception:
         return False
 
@@ -65,6 +79,15 @@ def _json_to_df(path: str) -> pd.DataFrame:
 
 
 # ─── 保存・読込（Supabase / ローカル自動切替）────────────────────────────────
+def _save_local(config: dict):
+    with open(MASTER_PATH,  "w", encoding="utf-8") as f:
+        f.write(_df_to_json(st.session_state.master_data))
+    with open(INVOICE_PATH, "w", encoding="utf-8") as f:
+        f.write(_df_to_json(st.session_state.invoice_data))
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+
 def save_state():
     config = {
         "stores":         st.session_state.stores,
@@ -74,35 +97,48 @@ def save_state():
         "store_mapping":  st.session_state.store_mapping,
     }
     if _use_supabase():
-        sb = _get_supabase()
-        sb.table("app_storage").upsert({"key": "master_data",  "value": _df_to_records(st.session_state.master_data)}).execute()
-        sb.table("app_storage").upsert({"key": "invoice_data", "value": _df_to_records(st.session_state.invoice_data)}).execute()
-        sb.table("app_storage").upsert({"key": "config",       "value": config}).execute()
+        try:
+            sb = _get_supabase()
+            sb.table("app_storage").upsert({"key": "master_data",  "value": _df_to_records(st.session_state.master_data)}).execute()
+            sb.table("app_storage").upsert({"key": "invoice_data", "value": _df_to_records(st.session_state.invoice_data)}).execute()
+            sb.table("app_storage").upsert({"key": "config",       "value": config}).execute()
+        except Exception:
+            _save_local(config)
     else:
-        with open(MASTER_PATH,  "w", encoding="utf-8") as f:
-            f.write(_df_to_json(st.session_state.master_data))
-        with open(INVOICE_PATH, "w", encoding="utf-8") as f:
-            f.write(_df_to_json(st.session_state.invoice_data))
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
+        _save_local(config)
+    # 常にローカルにもバックアップ保存
+    _save_local(config)
+
+
+def _load_local() -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
+    master  = _json_to_df(MASTER_PATH)
+    invoice = _json_to_df(INVOICE_PATH)
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+    return master, invoice, cfg
 
 
 def load_state():
     if "state_loaded" in st.session_state:
         return
     if _use_supabase():
-        sb = _get_supabase()
-        rows = {r["key"]: r["value"] for r in sb.table("app_storage").select("key, value").execute().data}
-        st.session_state.master_data  = _records_to_df(rows.get("master_data") or [])
-        st.session_state.invoice_data = _records_to_df(rows.get("invoice_data") or [])
-        cfg = rows.get("config") or {}
+        try:
+            sb = _get_supabase()
+            rows = {r["key"]: r["value"] for r in sb.table("app_storage").select("key, value").execute().data}
+            master  = _records_to_df(rows.get("master_data") or [])
+            invoice = _records_to_df(rows.get("invoice_data") or [])
+            cfg = rows.get("config") or {}
+            st.session_state.master_data  = master
+            st.session_state.invoice_data = invoice
+            st.session_state._storage_mode = f"Supabase (master={len(master)}, invoice={len(invoice)})"
+        except Exception as e:
+            st.session_state.master_data, st.session_state.invoice_data, cfg = _load_local()
+            st.session_state._storage_mode = f"ローカル (Supabaseエラー: {e})"
     else:
-        st.session_state.master_data  = _json_to_df(MASTER_PATH)
-        st.session_state.invoice_data = _json_to_df(INVOICE_PATH)
-        cfg = {}
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, encoding="utf-8") as f:
-                cfg = json.load(f)
+        st.session_state.master_data, st.session_state.invoice_data, cfg = _load_local()
+        st.session_state._storage_mode = "ローカル (Supabase未設定)"
     st.session_state.stores         = cfg.get("stores",         ["元町駅前店", "加古川駅前店", "加古川今福店"])
     st.session_state.platform_fees  = cfg.get("platform_fees",  {"よやクル": 10.0, "インスタベース": 30.0, "スペースマーケット": 30.0})
     st.session_state.fixed_costs    = cfg.get("fixed_costs",    {})
@@ -380,6 +416,8 @@ with st.sidebar:
     st.caption(f"総レコード: {total_records:,} 件")
     if pending > 0:
         st.warning(f"入金確認待ち: {pending} 件")
+    if st.session_state.get("_storage_mode"):
+        st.caption(f"💾 {st.session_state._storage_mode}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
