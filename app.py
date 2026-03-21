@@ -18,6 +18,12 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 DATETIME_COLS = ["利用日", "支払日"]
 
+def _safe_int(v, default=0):
+    try:
+        return int(float(v))
+    except (ValueError, TypeError):
+        return default
+
 def _use_supabase() -> bool:
     try:
         url = st.secrets.get("supabase", {}).get("url", "")
@@ -593,7 +599,7 @@ elif page == "📥 データ取込":
                     with ec1:
                         deposit = st.number_input(
                             "実際の入金額（円）", min_value=0, step=100,
-                            value=int(float(row.get("入金額", 0) or 0)),
+                            value=_safe_int(row.get("入金額", 0)),
                             key=f"md_dep_{idx}",
                         )
                     with ec2:
@@ -771,7 +777,7 @@ elif page == "📄 請求書管理":
                         with ec1:
                             deposit = st.number_input(
                                 "入金額（円）", min_value=0, step=100,
-                                value=int(float(row.get("入金額", 0) or 0)),
+                                value=_safe_int(row.get("入金額", 0)),
                                 key=f"inv_dep_{idx}",
                             )
                         with ec2:
@@ -838,7 +844,7 @@ elif page == "📄 請求書管理":
 
                     fc4, fc5 = st.columns(2)
                     with fc4:
-                        new_amount = st.number_input("請求金額（円）", min_value=0, step=100, value=int(edit_row["実売上"]))
+                        new_amount = st.number_input("請求金額（円）", min_value=0, step=100, value=_safe_int(edit_row["実売上"]))
                     with fc5:
                         new_note = st.text_input("備考", value=edit_row.get("備考", "") or "")
 
