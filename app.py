@@ -593,7 +593,7 @@ elif page == "📥 データ取込":
                     with ec1:
                         deposit = st.number_input(
                             "実際の入金額（円）", min_value=0, step=100,
-                            value=int(row.get("入金額", 0)),
+                            value=int(float(row.get("入金額", 0) or 0)),
                             key=f"md_dep_{idx}",
                         )
                     with ec2:
@@ -771,7 +771,7 @@ elif page == "📄 請求書管理":
                         with ec1:
                             deposit = st.number_input(
                                 "入金額（円）", min_value=0, step=100,
-                                value=int(row.get("入金額", 0)),
+                                value=int(float(row.get("入金額", 0) or 0)),
                                 key=f"inv_dep_{idx}",
                             )
                         with ec2:
