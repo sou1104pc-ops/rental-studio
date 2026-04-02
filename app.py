@@ -1101,7 +1101,7 @@ elif page == "📈 損益レポート":
         valid_fmt = {k: v for k, v in fmt_cols.items() if k in df_view.columns}
         styled = df_view.style.format(valid_fmt, na_rep="-")
         if "営業利益" in df_view.columns:
-            styled = styled.applymap(color_profit, subset=["営業利益"])
+            styled = styled.map(color_profit, subset=["営業利益"])
         st.dataframe(styled, use_container_width=True)
 
     def pl_chart(df_view: pd.DataFrame, title: str, show_business_cost: bool = False):
