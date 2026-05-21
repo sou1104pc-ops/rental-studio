@@ -336,6 +336,7 @@ def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
         usage_dates = parse_yoyakuru_usage_date(df_raw[schema["usage_date"]], payment_dates)
     else:
         usage_dates = pd.to_datetime(df_raw[schema["usage_date"]], errors="coerce")
+    usage_dates = pd.to_datetime(usage_dates, errors="coerce")
 
     # ── 金額処理 ──
     売上 = parse_amount(df_raw[schema["amount"]])

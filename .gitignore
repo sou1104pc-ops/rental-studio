@@ -1,5 +1,6 @@
 .streamlit/secrets.toml
 data/
+backups/
 __pycache__/
 *.pyc
 .DS_Store
