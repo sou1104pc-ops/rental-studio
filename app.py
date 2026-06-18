@@ -410,7 +410,7 @@ with st.sidebar:
     st.title("🏢 合同会社ScalePro")
     page = st.radio(
         "ナビゲーション",
-        ["📊 ダッシュボード", "📥 データ取込", "📄 請求書管理",
+        ["📊 ダッシュボード", "🏪 媒体別売上", "📥 データ取込", "📄 請求書管理",
          "⚙️ 設定", "📈 損益レポート", "👥 顧客分析", "🔍 予約検索"],
         label_visibility="collapsed",
     )
@@ -486,6 +486,96 @@ if page == "📊 ダッシュボード":
         fig4 = px.pie(df.groupby("決済方法")["売上"].sum().reset_index(),
                       values="売上", names="決済方法", title="決済方法別売上")
         st.plotly_chart(fig4, use_container_width=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🏪 媒体別売上（店舗 × プラットフォーム × 月）
+# ════════════════════════════════════════════════════════════════════════════
+elif page == "🏪 媒体別売上":
+    st.title("🏪 媒体別売上")
+    st.caption("スペースマーケット・インスタベース・よやクルごとの売上を、店舗別・月別に表示します。")
+
+    df = get_confirmed_data()
+    if df is None:
+        st.info("確認済みデータがありません。「データ取込」からCSVをアップロードしてください。")
+        st.stop()
+
+    metric_label = st.radio(
+        "表示する金額",
+        ["売上", "実売上", "手取り"],
+        horizontal=True,
+        help="売上=額面　実売上=返金・割引差引後　手取り=手数料差引後",
+    )
+
+    # データに存在するプラットフォーム（主要3媒体を先頭に、請求書等は後ろに）
+    present    = list(df["プラットフォーム"].unique())
+    plat_order = [p for p in PLATFORMS if p in present] + [p for p in present if p not in PLATFORMS]
+
+    # 表示する店舗 = 設定の店舗 ∪ データに実在する店舗（設定漏れの店舗も取りこぼさない）
+    data_stores  = [s for s in df["店舗"].dropna().astype(str).unique() if s.strip()]
+    store_list   = list(st.session_state.stores) + [s for s in data_stores if s not in st.session_state.stores]
+    unconfigured = [s for s in data_stores if s not in st.session_state.stores]
+    if unconfigured:
+        st.caption("⚠️ 設定の店舗一覧に未登録ですが、データに売上がある店舗も表示しています："
+                   + "、".join(unconfigured))
+
+    def pivot_store_platform(d: pd.DataFrame) -> pd.DataFrame:
+        """月（行）× プラットフォーム（列）の売上クロス集計。合計行・列付き。"""
+        pv = (
+            d.pivot_table(index="月", columns="プラットフォーム",
+                          values=metric_label, aggfunc="sum", fill_value=0)
+             .reindex(columns=plat_order, fill_value=0)
+             .sort_index()
+        )
+        pv["合計"] = pv.sum(axis=1)
+        total_row = pd.DataFrame(pv.sum(axis=0)).T
+        total_row.index = ["合計"]
+        return pd.concat([pv, total_row])
+
+    fmt_map = {c: fmt_yen for c in plat_order + ["合計"]}
+
+    def show_store(d: pd.DataFrame, title: str):
+        cols = st.columns(len(plat_order) + 1)
+        for j, p in enumerate(plat_order):
+            cols[j].metric(p, fmt_yen(d[d["プラットフォーム"] == p][metric_label].sum()))
+        cols[-1].metric("合計", fmt_yen(d[metric_label].sum()))
+
+        st.dataframe(pivot_store_platform(d).style.format(fmt_map), use_container_width=True)
+
+        g = d.groupby(["月", "プラットフォーム"])[metric_label].sum().reset_index()
+        fig = px.bar(g, x="月", y=metric_label, color="プラットフォーム",
+                     title=title, category_orders={"プラットフォーム": plat_order})
+        st.plotly_chart(fig, use_container_width=True)
+
+    tab_all, *tab_stores = st.tabs(["🌐 事業全体"] + store_list)
+
+    with tab_all:
+        st.subheader("事業全体（全店舗合算）")
+        show_store(df, f"月別・媒体別 {metric_label}（全店舗）")
+
+    for i, store in enumerate(store_list):
+        with tab_stores[i]:
+            sd = df[df["店舗"] == store]
+            if sd.empty:
+                st.info(f"{store} のデータはまだありません。")
+                continue
+            st.subheader(store)
+            show_store(sd, f"{store}：月別・媒体別 {metric_label}")
+
+    # ── 店舗 × 媒体 × 月 のクロス集計をCSVダウンロード ──
+    st.divider()
+    cross = (
+        df.pivot_table(index=["店舗", "月"], columns="プラットフォーム",
+                       values=metric_label, aggfunc="sum", fill_value=0)
+          .reindex(columns=plat_order, fill_value=0)
+    )
+    cross["合計"] = cross.sum(axis=1)
+    csv = cross.reset_index().to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "📥 店舗×媒体×月 CSVをダウンロード", data=csv,
+        file_name=f"store_platform_{metric_label}_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
