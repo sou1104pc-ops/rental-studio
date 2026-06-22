@@ -2,6 +2,7 @@ from typing import Optional, Tuple
 import re
 import json
 import os
+import unicodedata
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -271,9 +272,33 @@ def parse_yoyakuru_usage_date(usage_series: pd.Series,
     return pd.Series(results, index=usage_series.index)
 
 
+def _clean_key(s: str) -> str:
+    """比較用にNFKC正規化し、全角/半角/ゼロ幅も含めた全空白を除去した小文字キーを返す。"""
+    s = unicodedata.normalize("NFKC", str(s))
+    s = re.sub(r"[\s​‌‍﻿　]+", "", s)
+    return s.lower()
+
+
+def resolve_store(name: str) -> str:
+    """CSV上の店舗名を登録店舗名に正規化する。
+    完全一致がなければ、登録店舗名を部分文字列として含む名前（例
+    「SPACE NONO for business 元町駅前店」→「元町駅前店」）を自動でマッチさせる。
+    全角スペース・不可視文字・全半角の違いも吸収。複数該当時は最も長い登録店舗名を優先。"""
+    raw = str(name).strip()
+    stores = st.session_state.stores
+    if raw in stores:
+        return raw
+    key = _clean_key(raw)
+    for s in sorted(stores, key=len, reverse=True):
+        if s and _clean_key(s) in key:
+            return s
+    return raw
+
+
 def apply_store_mapping(platform: str, name: str) -> str:
     key = f"{platform}_{name}"
-    return st.session_state.store_mapping.get(key, name)
+    mapped = st.session_state.store_mapping.get(key)
+    return mapped if mapped is not None else resolve_store(name)
 
 
 def fmt_yen(v):
@@ -303,11 +328,21 @@ def _rebuild_cache():
     st.session_state._pending_count    = int((~st.session_state._all_data["確認済み"]).sum()) if not st.session_state._all_data.empty and "確認済み" in st.session_state._all_data.columns else 0
 
 
+def _normalize_stores(df: pd.DataFrame) -> pd.DataFrame:
+    """店舗名を登録店舗名に正規化して返す（取込済み・取込前を問わず常に最新ルールを適用）。
+    例「SPACE NONO for business 元町駅前店」→「元町駅前店」。"""
+    if df is None or df.empty or "店舗" not in df.columns:
+        return df
+    df = df.copy()
+    df["店舗"] = df["店舗"].astype(str).apply(resolve_store)
+    return df
+
+
 def get_confirmed_data() -> Optional[pd.DataFrame]:
     """確認済みデータ（キャッシュから取得）"""
     if "_confirmed_data" not in st.session_state:
         _rebuild_cache()
-    df = st.session_state._confirmed_data
+    df = _normalize_stores(st.session_state._confirmed_data)
     return df if not df.empty else None
 
 
@@ -315,7 +350,7 @@ def get_all_data() -> Optional[pd.DataFrame]:
     """全データ（キャッシュから取得）"""
     if "_all_data" not in st.session_state:
         _rebuild_cache()
-    df = st.session_state._all_data
+    df = _normalize_stores(st.session_state._all_data)
     return df if not df.empty else None
 
 
@@ -690,13 +725,14 @@ elif page == "📥 データ取込":
                     with ec1:
                         deposit = st.number_input(
                             "実際の入金額（円）", min_value=0, step=100,
-                            value=_safe_int(row.get("入金額", 0)),
+                            # 未入力（0）のときは請求額（実売上）を初期値にして、そのまま確認できるように
+                            value=_safe_int(row.get("入金額", 0) or row.get("実売上", 0)),
                             key=f"md_dep_{idx}",
                         )
                     with ec2:
                         deposit_status = st.selectbox(
                             "入金ステータス",
-                            ["未入金", "入金済み", "金額不一致", "未入金（督促済み）"],
+                            ["入金済み", "金額不一致", "未入金", "未入金（督促済み）"],
                             index=0, key=f"md_status_{idx}",
                         )
                     with ec3:
@@ -710,7 +746,8 @@ elif page == "📥 データ取込":
                         st.session_state.master_data.at[idx, "入金額"] = float(deposit)
                         st.session_state.master_data.at[idx, "入金ステータス"] = deposit_status
                         st.session_state.master_data.at[idx, "支払日"] = pd.Timestamp(deposit_date)
-                        if deposit_status == "入金済み":
+                        # 入金があった（入金済み／金額不一致）ものは確認済みにして売上へ反映
+                        if deposit_status in ("入金済み", "金額不一致"):
                             st.session_state.master_data.at[idx, "確認済み"] = True
                             st.session_state.master_data.at[idx, "手取り"] = float(deposit)
                         else:
@@ -779,7 +816,12 @@ elif page == "📄 請求書管理":
         with c1:
             inv_store   = st.selectbox("店舗", st.session_state.stores, key="inv_store")
         with c2:
-            inv_month   = st.selectbox("対象月", MONTH_OPTIONS, key="inv_month")
+            _cur_month  = datetime.now().strftime("%Y-%m")
+            inv_month   = st.selectbox(
+                "対象月", MONTH_OPTIONS,
+                index=MONTH_OPTIONS.index(_cur_month) if _cur_month in MONTH_OPTIONS else 0,
+                key="inv_month",
+            )
         with c3:
             inv_number  = st.text_input("請求書番号", placeholder="例: INV-2026-001", key="inv_num")
 
@@ -868,13 +910,14 @@ elif page == "📄 請求書管理":
                         with ec1:
                             deposit = st.number_input(
                                 "入金額（円）", min_value=0, step=100,
-                                value=_safe_int(row.get("入金額", 0)),
+                                # 未入力（0）のときは請求額（実売上）を初期値にして、そのまま確認できるように
+                                value=_safe_int(row.get("入金額", 0) or row.get("実売上", 0)),
                                 key=f"inv_dep_{idx}",
                             )
                         with ec2:
                             deposit_status = st.selectbox(
                                 "入金ステータス",
-                                ["未入金", "入金済み", "金額不一致", "未入金（督促済み）"],
+                                ["入金済み", "金額不一致", "未入金", "未入金（督促済み）"],
                                 index=0, key=f"inv_status_{idx}",
                             )
                         deposit_date = st.date_input("入金日", value=datetime.now().date(), key=f"inv_depdate_{idx}")
@@ -883,7 +926,8 @@ elif page == "📄 請求書管理":
                             st.session_state.invoice_data.at[idx, "入金額"] = float(deposit)
                             st.session_state.invoice_data.at[idx, "入金ステータス"] = deposit_status
                             st.session_state.invoice_data.at[idx, "支払日"] = pd.Timestamp(deposit_date)
-                            if deposit_status == "入金済み":
+                            # 入金があった（入金済み／金額不一致）ものは確認済みにして売上へ反映
+                            if deposit_status in ("入金済み", "金額不一致"):
                                 st.session_state.invoice_data.at[idx, "確認済み"] = True
                                 st.session_state.invoice_data.at[idx, "手取り"] = float(deposit)
                             else:
