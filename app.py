@@ -515,19 +515,6 @@ def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
 
 MANUAL_COLS = ["利用日", "店舗", "顧客名", "売上", "手取り（振込額）", "決済方法"]
 
-
-def _empty_manual_df(rows: int = 5) -> pd.DataFrame:
-    """空欄が「None」と表示されないよう、列ごとに適切な型で空表を作る"""
-    return pd.DataFrame({
-        "利用日":          pd.Series([pd.NaT] * rows, dtype="datetime64[ns]"),
-        "店舗":            pd.Series([None] * rows,   dtype="object"),
-        "顧客名":          pd.Series([""] * rows,     dtype="object"),
-        "売上":            pd.Series([float("nan")] * rows, dtype="float64"),
-        "手取り（振込額）": pd.Series([float("nan")] * rows, dtype="float64"),
-        "決済方法":        pd.Series([""] * rows,     dtype="object"),
-    })
-
-
 _YMD_RE = re.compile(r"(\d{4})\s*[-/年.]\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})")
 _MD_RE  = re.compile(r"^\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})")
 
@@ -1045,36 +1032,43 @@ elif page == "📥 データ取込":
         st.caption(f"手数料率 **{m_rate}%** で手取りを計算します（設定 → 💳 手数料設定 で変更）。"
                    "「手取り（振込額）」を入力した行は、その実額を優先します。")
 
-    tab_edit, tab_paste = st.tabs(["⌨️ 表に直接入力", "📋 貼り付けて取込"])
+    tab_edit, tab_paste = st.tabs(["⌨️ 1件ずつ入力", "📋 貼り付けて取込"])
 
     with tab_edit:
-        edited = st.data_editor(
-            _empty_manual_df(),
-            num_rows="dynamic",
-            use_container_width=True,
-            key="manual_editor",
-            column_config={
-                "利用日": st.column_config.DateColumn("利用日 *", format="YYYY-MM-DD"),
-                "店舗":   st.column_config.SelectboxColumn("店舗 *", options=st.session_state.stores),
-                "顧客名": st.column_config.TextColumn("顧客名"),
-                "売上":   st.column_config.NumberColumn("売上 *", format="%d", min_value=0),
-                "手取り（振込額）": st.column_config.NumberColumn("手取り（振込額）", format="%d", min_value=0),
-                "決済方法": st.column_config.TextColumn("決済方法", help="例: クレジットカード / 現地払い"),
-            },
-        )
-        if st.button("✅ 入力した内容を登録", key="manual_register"):
-            new_cnt, dup_cnt, skipped = register_manual_rows(m_platform, edited)
-            for s in skipped:
-                st.warning(s)
-            if new_cnt > 0:
-                st.success(f"✅ {new_cnt:,} 件を登録しました（重複スキップ: {dup_cnt:,} 件）")
-                save_state()
-                _rebuild_cache()
-                st.rerun()
-            elif dup_cnt > 0:
-                st.warning(f"すべて登録済みでした（{dup_cnt:,} 件）")
+        with st.form("manual_single_form"):
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                f_date  = st.date_input("利用日 *", value=datetime.now().date(), key="manual_date")
+                f_store = st.selectbox("店舗 *", st.session_state.stores, key="manual_store")
+            with f2:
+                f_amount = st.number_input("売上（円）*", min_value=0, step=100, key="manual_amount")
+                f_net    = st.number_input("手取り（振込額・円）", min_value=0, step=100,
+                                           key="manual_net",
+                                           help="0のままなら手数料率から自動計算します")
+            with f3:
+                f_cust = st.text_input("顧客名", key="manual_cust")
+                f_pay  = st.text_input("決済方法", key="manual_pay",
+                                       placeholder="例: クレジットカード / 現地払い")
+            submitted_manual = st.form_submit_button("✅ この1件を登録")
+
+        if submitted_manual:
+            if f_amount <= 0:
+                st.error("売上を入力してください。")
             else:
-                st.info("登録できる行がありませんでした。利用日と売上を入力してください。")
+                row = pd.DataFrame([{
+                    "利用日": pd.Timestamp(f_date), "店舗": f_store, "顧客名": f_cust,
+                    "売上": f_amount, "手取り（振込額）": f_net or None, "決済方法": f_pay,
+                }])
+                new_cnt, dup_cnt, skipped = register_manual_rows(m_platform, row)
+                for s in skipped:
+                    st.warning(s)
+                if new_cnt > 0:
+                    st.success(f"✅ {f_date} / {f_store} / {fmt_yen(f_amount)} を登録しました")
+                    save_state()
+                    _rebuild_cache()
+                    st.rerun()
+                elif dup_cnt > 0:
+                    st.warning("同じ内容がすでに登録されています（利用日・店舗・顧客名・金額が同一）")
 
     with tab_paste:
         st.caption("よやっぴんの予約一覧などをドラッグしてコピー → 下に貼り付け（タブ区切り／カンマ区切り）。"
