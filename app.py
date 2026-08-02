@@ -102,6 +102,7 @@ def save_state():
         "fixed_costs":    st.session_state.fixed_costs,
         "business_costs": st.session_state.business_costs,
         "store_mapping":  st.session_state.store_mapping,
+        "csv_formats":    st.session_state.get("csv_formats", {}),
     }
     if _use_supabase():
         try:
@@ -147,10 +148,12 @@ def load_state():
         st.session_state.master_data, st.session_state.invoice_data, cfg = _load_local()
         st.session_state._storage_mode = "ローカル (Supabase未設定)"
     st.session_state.stores         = cfg.get("stores",         ["元町駅前店", "加古川駅前店", "加古川今福店"])
-    st.session_state.platform_fees  = cfg.get("platform_fees",  {"よやクル": 10.0, "インスタベース": 30.0, "スペースマーケット": 30.0})
+    # 既存の保存値を優先しつつ、新しく追加した媒体はデフォルト率で補完する
+    st.session_state.platform_fees  = {**DEFAULT_PLATFORM_FEES, **cfg.get("platform_fees", {})}
     st.session_state.fixed_costs    = cfg.get("fixed_costs",    {})
     st.session_state.business_costs = cfg.get("business_costs", {})
     st.session_state.store_mapping  = cfg.get("store_mapping",  {})
+    st.session_state.csv_formats    = cfg.get("csv_formats",    {})   # 手動登録したCSV列マッピング
     st.session_state.state_loaded  = True
 
 st.set_page_config(
@@ -160,7 +163,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-PLATFORMS = ["よやクル", "インスタベース", "スペースマーケット"]
+PLATFORMS = ["よやクル", "インスタベース", "スペースマーケット", "よやっぴん", "カシカシ"]
+
+DEFAULT_PLATFORM_FEES = {
+    "よやクル":         10.0,
+    "インスタベース":   30.0,
+    "スペースマーケット": 30.0,
+    "よやっぴん":       30.0,   # ← 実際の料率は「設定 → 手数料設定」で変更してください
+    "カシカシ":         30.0,   # ← 同上
+}
 
 # ─── プラットフォーム自動検出スキーマ ──────────────────────────────────────────
 PLATFORM_SCHEMAS = {
@@ -208,6 +219,36 @@ PLATFORM_SCHEMAS = {
     },
 }
 
+# よやっぴん・カシカシなど、CSV書式が未登録の媒体は
+# 「データ取込」画面の列マッピングで登録すると、この形式で config に保存され
+# 以降は自動判別される（保存先: config.json の csv_formats）
+SCHEMA_FIELDS = [
+    ("usage_date",     "利用日",       True),
+    ("date",           "支払日・決済日", False),
+    ("store",          "店舗名（スペース名）", True),
+    ("amount",         "売上金額",     True),
+    ("net_amount",     "手取り（振込額）", False),
+    ("refund",         "返金額",       False),
+    ("discount",       "割引額",       False),
+    ("booking_id",     "予約ID",       False),
+    ("customer",       "顧客名",       False),
+    ("payment_method", "決済方法",     False),
+]
+
+
+def custom_schemas() -> dict:
+    return st.session_state.get("csv_formats", {}) or {}
+
+
+def get_schema(platform: str) -> Optional[dict]:
+    """組込みスキーマ → 手動登録スキーマ の順で解決する"""
+    return PLATFORM_SCHEMAS.get(platform) or custom_schemas().get(platform)
+
+
+def all_platforms() -> list:
+    """組込み媒体＋手動登録した媒体（重複なし・PLATFORMS優先順）"""
+    return PLATFORMS + [p for p in custom_schemas() if p not in PLATFORMS]
+
 MONTH_OPTIONS = (
     pd.date_range(
         start=f"{datetime.now().year - 1}-01",
@@ -223,12 +264,13 @@ def init_session():
     # ファイルがなかった項目だけデフォルト値をセット
     defaults = {
         "stores":         ["元町駅前店", "加古川駅前店", "加古川今福店"],
-        "platform_fees":  {"よやクル": 10.0, "インスタベース": 30.0, "スペースマーケット": 30.0},
+        "platform_fees":  dict(DEFAULT_PLATFORM_FEES),
         "fixed_costs":    {},
         "business_costs": {},   # 事業全体の経費（店舗に紐づかない）
         "master_data":    pd.DataFrame(),
         "invoice_data":   pd.DataFrame(),
         "store_mapping":  {},
+        "csv_formats":    {},
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -355,28 +397,44 @@ def get_all_data() -> Optional[pd.DataFrame]:
 
 
 def detect_platform(cols: list) -> Optional[str]:
-    for platform, schema in PLATFORM_SCHEMAS.items():
-        if all(sig in cols for sig in schema["signature"]):
+    # 組込みスキーマ → 手動登録スキーマ の順に判定
+    for platform, schema in {**PLATFORM_SCHEMAS, **custom_schemas()}.items():
+        sig = schema.get("signature") or []
+        if sig and all(s in cols for s in sig):
             return platform
     return None
 
 
+def _col(df: pd.DataFrame, name: Optional[str]) -> Optional[str]:
+    """スキーマで指定された列名が実際のCSVにあるときだけ返す"""
+    return name if name and name in df.columns else None
+
+
 def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
     """CSVを正規化してmaster_dataにマージ（重複は予約IDでスキップ）"""
-    schema = PLATFORM_SCHEMAS[platform]
+    schema = get_schema(platform)
+    if schema is None:
+        raise ValueError(f"{platform} のCSV形式が未登録です")
 
     # ── 日付処理 ──
-    payment_dates = pd.to_datetime(df_raw[schema["date"]], errors="coerce")
-    if platform == "よやクル":
-        usage_dates = parse_yoyakuru_usage_date(df_raw[schema["usage_date"]], payment_dates)
+    usage_col   = _col(df_raw, schema.get("usage_date"))
+    payment_col = _col(df_raw, schema.get("date")) or usage_col
+
+    payment_dates = pd.to_datetime(df_raw[payment_col], errors="coerce") if payment_col \
+        else pd.Series(pd.NaT, index=df_raw.index)
+    # 「MM/DD (曜) HH:MM〜」のように年が無い利用日は支払日から年を補う
+    if usage_col and (platform == "よやクル" or schema.get("usage_date_mmdd")):
+        usage_dates = parse_yoyakuru_usage_date(df_raw[usage_col], payment_dates)
+    elif usage_col:
+        usage_dates = pd.to_datetime(df_raw[usage_col], errors="coerce")
     else:
-        usage_dates = pd.to_datetime(df_raw[schema["usage_date"]], errors="coerce")
+        usage_dates = payment_dates
     usage_dates = pd.to_datetime(usage_dates, errors="coerce")
 
     # ── 金額処理 ──
     売上 = parse_amount(df_raw[schema["amount"]])
-    返金 = parse_amount(df_raw[schema["refund"]]).fillna(0).abs() if schema["refund"] else pd.Series(0, index=df_raw.index)
-    割引 = parse_amount(df_raw[schema["discount"]]).fillna(0).abs() if schema["discount"] else pd.Series(0, index=df_raw.index)
+    返金 = parse_amount(df_raw[schema["refund"]]).fillna(0).abs() if _col(df_raw, schema.get("refund")) else pd.Series(0, index=df_raw.index)
+    割引 = parse_amount(df_raw[schema["discount"]]).fillna(0).abs() if _col(df_raw, schema.get("discount")) else pd.Series(0, index=df_raw.index)
     実売上 = 売上 - 返金 - 割引
 
     # ── 決済方法 ──
@@ -391,23 +449,38 @@ def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
     is_bank = 決済方法.apply(lambda v: any(k in str(v) for k in keywords)) if keywords else pd.Series(False, index=df_raw.index)
 
     # ── 手数料計算 ──
-    if schema["net_amount"] and schema["net_amount"] in df_raw.columns:
+    if _col(df_raw, schema.get("net_amount")):
         手取り   = parse_amount(df_raw[schema["net_amount"]]).fillna(0)
         手数料   = (実売上 - 手取り).clip(lower=0)
         手数料率 = (手数料 / 実売上.replace(0, pd.NA) * 100).fillna(0).round(1)
     else:
-        fee_rate = st.session_state.platform_fees[platform]
+        fee_rate = float(st.session_state.platform_fees.get(platform, DEFAULT_PLATFORM_FEES.get(platform, 30.0)))
         手数料率 = pd.Series(fee_rate, index=df_raw.index)
         手数料   = 実売上 * fee_rate / 100
         手取り   = 実売上 - 手数料
+
+    店舗 = df_raw[schema["store"]].astype(str).apply(lambda n: apply_store_mapping(platform, n))
+    顧客名 = df_raw[schema["customer"]].astype(str) if _col(df_raw, schema.get("customer")) \
+        else pd.Series("不明", index=df_raw.index)
+
+    # ── 予約ID（列が無い媒体は内容から重複判定用のIDを生成）──
+    if _col(df_raw, schema.get("booking_id")):
+        予約ID = df_raw[schema["booking_id"]].astype(str)
+    else:
+        予約ID = pd.Series(
+            [f"{platform}-{d:%Y%m%d}-{s}-{c}-{a:.0f}" if pd.notna(d) and pd.notna(a)
+             else f"{platform}-{d}-{s}-{c}-{a}"
+             for d, s, c, a in zip(usage_dates, 店舗, 顧客名, 実売上)],
+            index=df_raw.index,
+        )
 
     dp = pd.DataFrame({
         "利用日":         usage_dates,
         "支払日":         payment_dates,
         "月":             usage_dates.dt.strftime("%Y-%m"),
-        "店舗":           df_raw[schema["store"]].astype(str).apply(lambda n: apply_store_mapping(platform, n)),
-        "顧客名":         df_raw[schema["customer"]].astype(str) if schema["customer"] else "不明",
-        "予約ID":         df_raw[schema["booking_id"]].astype(str) if schema["booking_id"] else "",
+        "店舗":           店舗,
+        "顧客名":         顧客名,
+        "予約ID":         予約ID,
         "決済方法":       決済方法,
         "売上":           売上,
         "割引":           割引,
@@ -438,6 +511,262 @@ def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
     dup_count = len(dp) - new_count
     st.session_state.master_data = merged.reset_index(drop=True)
     return new_count, dup_count
+
+
+MANUAL_COLS = ["利用日", "店舗", "顧客名", "売上", "手取り（振込額）", "決済方法"]
+
+
+def _empty_manual_df(rows: int = 5) -> pd.DataFrame:
+    return pd.DataFrame({
+        "利用日":          [None] * rows,
+        "店舗":            [None] * rows,
+        "顧客名":          [""]   * rows,
+        "売上":            [None] * rows,
+        "手取り（振込額）": [None] * rows,
+        "決済方法":        [""]   * rows,
+    })
+
+
+_YMD_RE = re.compile(r"(\d{4})\s*[-/年.]\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})")
+_MD_RE  = re.compile(r"^\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})")
+
+
+def parse_manual_dates(series: pd.Series) -> pd.Series:
+    """手入力・貼り付けの日付をできるだけ拾う。
+    「2026/8/1」「2026-08-02」「2026年8月1日」「8/1（年なし→今年）」「2026/8/1 10:00〜」に対応。"""
+    parsed = pd.to_datetime(series, errors="coerce")
+    for i in series.index:
+        if pd.notna(parsed[i]):
+            continue
+        raw = unicodedata.normalize("NFKC", str(series[i])).strip()
+        if not raw or raw.lower() in ("nan", "none", "nat"):
+            continue
+        m = _YMD_RE.search(raw)
+        if m:
+            y, mo, d = (int(g) for g in m.groups())
+        else:
+            m = _MD_RE.match(raw)
+            if not m:
+                continue
+            mo, d = (int(g) for g in m.groups())
+            y = datetime.now().year   # 年が無い場合は今年とみなす
+        try:
+            parsed[i] = pd.Timestamp(year=y, month=mo, day=d)
+        except ValueError:
+            continue
+    return pd.to_datetime(parsed, errors="coerce")
+
+
+def register_manual_rows(platform: str, rows: pd.DataFrame) -> Tuple[int, int, list]:
+    """手入力／貼り付けの行を master_data に登録する。
+    戻り値: (新規件数, 重複スキップ件数, 取り込めなかった行の説明)"""
+    df = rows.copy()
+    for c in MANUAL_COLS:
+        if c not in df.columns:
+            df[c] = None
+
+    利用日     = parse_manual_dates(df["利用日"])
+    売上       = parse_amount(df["売上"].astype(str))
+    手取り入力 = parse_amount(df["手取り（振込額）"].astype(str))
+
+    skipped = []
+    for i in df.index:
+        if pd.isna(利用日[i]) and pd.isna(売上[i]):
+            continue   # 空行は黙って無視
+        if pd.isna(利用日[i]):
+            skipped.append(f"{i + 1}行目: 利用日が読めません（{df.at[i, '利用日']}）")
+        elif pd.isna(売上[i]):
+            skipped.append(f"{i + 1}行目: 売上が読めません（{df.at[i, '売上']}）")
+
+    ok = 利用日.notna() & 売上.notna()
+    if not ok.any():
+        return 0, 0, skipped
+
+    df, 利用日, 売上, 手取り入力 = df[ok], 利用日[ok], 売上[ok], 手取り入力[ok]
+
+    店舗   = df["店舗"].astype(str).apply(lambda n: apply_store_mapping(platform, n))
+    顧客名 = df["顧客名"].fillna("").astype(str).replace("", "不明")
+    決済方法 = df["決済方法"].fillna("").astype(str).replace("", "不明")
+
+    fee_rate = float(st.session_state.platform_fees.get(
+        platform, DEFAULT_PLATFORM_FEES.get(platform, 30.0)))
+    手数料率 = pd.Series(fee_rate, index=df.index, dtype=float)
+    手取り   = 売上 * (1 - fee_rate / 100)
+    # 振込額を直接入力した行は、その実額から手数料を逆算する
+    直接 = 手取り入力.notna() & (手取り入力 > 0)
+    手取り.loc[直接]   = 手取り入力[直接]
+    手数料率.loc[直接] = ((売上[直接] - 手取り入力[直接]) / 売上[直接].replace(0, pd.NA) * 100).fillna(0).round(1)
+    手数料 = 売上 - 手取り
+
+    # 同じ内容の行が同一バッチ内に複数あっても消えないよう連番を付ける
+    ids, seen = [], {}
+    for d, s, c, a in zip(利用日, 店舗, 顧客名, 売上):
+        base = f"手入力-{platform}-{d:%Y%m%d}-{s}-{c}-{a:.0f}"
+        seen[base] = seen.get(base, 0) + 1
+        ids.append(base if seen[base] == 1 else f"{base}-{seen[base]}")
+
+    dp = pd.DataFrame({
+        "利用日":         利用日.values,
+        "支払日":         利用日.values,
+        "月":             pd.Series(利用日.values).dt.strftime("%Y-%m").values,
+        "店舗":           店舗.values,
+        "顧客名":         顧客名.values,
+        "予約ID":         ids,
+        "決済方法":       決済方法.values,
+        "売上":           売上.values,
+        "割引":           0.0,
+        "返金":           0.0,
+        "実売上":         売上.values,
+        "手数料率":       手数料率.values,
+        "手数料":         手数料.values,
+        "手取り":         手取り.values,
+        "プラットフォーム": platform,
+        "データ種別":     "手入力",
+        "確認済み":       True,
+    })
+
+    existing = st.session_state.master_data
+    if existing.empty:
+        merged = dp
+    else:
+        merged = pd.concat([existing, dp], ignore_index=True)
+        merged = merged.drop_duplicates(subset=["プラットフォーム", "予約ID"], keep="first")
+    new_count = len(merged) - len(existing)
+    st.session_state.master_data = merged.reset_index(drop=True)
+    return new_count, len(dp) - new_count, skipped
+
+
+def parse_pasted_table(text: str, has_header: bool) -> Optional[pd.DataFrame]:
+    """管理画面からコピーした表（タブ区切り／カンマ区切り）をDataFrameにする"""
+    lines = [l for l in text.splitlines() if l.strip()]
+    if not lines:
+        return None
+    sep  = "\t" if any("\t" in l for l in lines) else ","
+    rows = [l.split(sep) for l in lines]
+    width = max(len(r) for r in rows)
+    rows = [[c.strip() for c in r] + [""] * (width - len(r)) for r in rows]
+    if has_header and len(rows) > 1:
+        header = [c if c else f"列{i+1}" for i, c in enumerate(rows[0])]
+        return pd.DataFrame(rows[1:], columns=header)
+    return pd.DataFrame(rows, columns=[f"列{i+1}" for i in range(width)])
+
+
+NONE_LABEL = "（なし）"
+
+# 列名の自動推測用キーワード（前方から優先）
+COLUMN_HINTS = {
+    "usage_date":     ["利用日", "利用開始", "実施日", "ご利用日", "予約日", "開始日"],
+    "date":           ["決済日", "支払日", "お支払日", "入金日", "振込", "売上日", "成約日"],
+    "store":          ["スペース名", "施設名", "店舗名", "店舗", "物件", "会場",
+                       "ルーム", "部屋", "スペース", "施設"],
+    "amount":         ["料金", "利用金額", "予約金額", "成約金額", "売上金額", "合計金額", "決済元金", "金額"],
+    "net_amount":     ["振込予定", "振込金額", "手取り", "受取", "支払金額", "入金額"],
+    "refund":         ["返金", "キャンセル料"],
+    "discount":       ["割引", "クーポン", "値引"],
+    "booking_id":     ["予約ID", "予約番号", "決済ID", "受付番号", "注文番号", "ID"],
+    "customer":       ["予約者名", "ゲスト名", "利用者名", "お名前", "顧客名", "氏名", "HN",
+                       "会員名", "利用者", "名前"],
+    "payment_method": ["決済方法", "支払方法", "お支払い方法", "支払い方法"],
+}
+
+
+def _guess_col(cols: list, field: str) -> str:
+    """列名からそれらしい列を推測（見つからなければ「（なし）」）"""
+    for kw in COLUMN_HINTS.get(field, []):
+        for c in cols:
+            if kw in str(c):
+                return c
+    return NONE_LABEL
+
+
+def render_schema_builder(df_raw: pd.DataFrame, key_suffix: str = ""):
+    """未登録のCSV形式（よやっぴん・カシカシ等）に列を割り当てて登録するフォーム。
+    登録内容は config.json の csv_formats に保存され、以降は自動判別される。"""
+    cols    = df_raw.columns.tolist()
+    options = [NONE_LABEL] + cols
+    NEW     = "＋ 新しい媒体名を入力"
+
+    with st.form(f"schema_form_{key_suffix}"):
+        st.markdown("##### 1️⃣ 媒体を選ぶ")
+        c1, c2 = st.columns(2)
+        with c1:
+            cand = [p for p in all_platforms() if p not in PLATFORM_SCHEMAS]
+            plat_choice = st.selectbox("媒体（プラットフォーム）", cand + [NEW],
+                                       key=f"sb_plat_{key_suffix}")
+        with c2:
+            plat_new = st.text_input("新しい媒体名（上で「新しい媒体名」を選んだ場合）",
+                                     key=f"sb_platnew_{key_suffix}", placeholder="例: カシカシ")
+
+        st.markdown("##### 2️⃣ 列を割り当てる")
+        st.caption("必須は「利用日」「店舗名」「売上金額」。手取り列があれば実際の手数料が自動計算されます。")
+        sel = {}
+        fcols = st.columns(2)
+        for i, (field, label, required) in enumerate(SCHEMA_FIELDS):
+            guess = _guess_col(cols, field)
+            with fcols[i % 2]:
+                sel[field] = st.selectbox(
+                    f"{label}{' *' if required else ''}",
+                    options,
+                    index=options.index(guess) if guess in options else 0,
+                    key=f"sb_{field}_{key_suffix}",
+                )
+
+        st.markdown("##### 3️⃣ オプション")
+        c3, c4 = st.columns(2)
+        with c3:
+            mmdd = st.checkbox("利用日に年が無い（例「08/15 (金) 10:00〜」）",
+                               key=f"sb_mmdd_{key_suffix}")
+        with c4:
+            bank_kw = st.text_input("手動入金確認が必要な決済方法（カンマ区切り）",
+                                    key=f"sb_bank_{key_suffix}",
+                                    placeholder="例: 銀行振込, オフライン決済")
+
+        submitted = st.form_submit_button("💾 この形式を登録する")
+
+    if not submitted:
+        return
+
+    platform = plat_new.strip() if plat_choice == NEW else plat_choice
+    if not platform:
+        st.error("媒体名を入力してください。")
+        return
+    if platform in PLATFORM_SCHEMAS:
+        st.error(f"「{platform}」は組込み形式のため、ここでは登録できません。")
+        return
+
+    picked = {f: (None if v == NONE_LABEL else v) for f, v in sel.items()}
+    missing = [label for f, label, req in SCHEMA_FIELDS if req and not picked.get(f)]
+    if missing:
+        st.error("必須項目が未選択です： " + "、".join(missing))
+        return
+
+    # 自動判別用のシグネチャ（この形式を特定できる列の組み合わせ）
+    signature = [c for c in [picked.get("amount"), picked.get("store"),
+                             picked.get("booking_id") or picked.get("usage_date")] if c]
+    schema = {
+        "signature":      signature,
+        "date":           picked.get("date"),
+        "usage_date":     picked.get("usage_date"),
+        "store":          picked.get("store"),
+        "amount":         picked.get("amount"),
+        "refund":         picked.get("refund"),
+        "discount":       picked.get("discount"),
+        "booking_id":     picked.get("booking_id"),
+        "customer":       picked.get("customer"),
+        "net_amount":     picked.get("net_amount"),
+        "payment_method": picked.get("payment_method"),
+        "bank_transfer_keywords": [k.strip() for k in bank_kw.split(",") if k.strip()],
+        "usage_date_mmdd": bool(mmdd),
+    }
+
+    formats = dict(custom_schemas())
+    formats[platform] = schema
+    st.session_state.csv_formats = formats
+    st.session_state.platform_fees.setdefault(
+        platform, DEFAULT_PLATFORM_FEES.get(platform, 30.0))
+    save_state()
+    st.success(f"✅ 「{platform}」のCSV形式を登録しました。取込ボタンが表示されます。")
+    st.rerun()
 
 
 # ─── サイドバー ───────────────────────────────────────────────────────────────
@@ -528,7 +857,8 @@ if page == "📊 ダッシュボード":
 # ════════════════════════════════════════════════════════════════════════════
 elif page == "🏪 媒体別売上":
     st.title("🏪 媒体別売上")
-    st.caption("スペースマーケット・インスタベース・よやクルごとの売上を、店舗別・月別に表示します。")
+    st.caption("よやクル・インスタベース・スペースマーケット・よやっぴん・カシカシなど、"
+               "媒体ごとの売上を店舗別・月別に表示します。")
 
     df = get_confirmed_data()
     if df is None:
@@ -618,7 +948,8 @@ elif page == "🏪 媒体別売上":
 # ════════════════════════════════════════════════════════════════════════════
 elif page == "📥 データ取込":
     st.title("📥 データ取込")
-    st.caption("CSVをアップロードするとプラットフォームを自動判別します。重複は予約ID/決済IDで自動スキップ。")
+    st.caption("CSVをアップロードするとプラットフォームを自動判別します。重複は予約ID/決済IDで自動スキップ。"
+               "未対応の媒体（よやっぴん・カシカシ等）は、その場で列を割り当てれば取込＆次回から自動判別されます。")
 
     # ── CSV アップロード ──
     uploaded_files = st.file_uploader(
@@ -653,12 +984,14 @@ elif page == "📥 データ取込":
 
             platform = detect_platform(df_raw.columns.tolist())
             if platform is None:
-                st.error("プラットフォームを自動判別できませんでした。")
+                st.warning("プラットフォームを自動判別できませんでした。下でCSVの列を割り当てると、この形式を登録できます（次回から自動判別されます）。")
                 st.caption("検出された列名:")
                 st.code(", ".join(df_raw.columns.tolist()))
+                st.dataframe(df_raw.head(3), use_container_width=True)
+                render_schema_builder(df_raw, key_suffix=uploaded.name)
                 continue
 
-            schema = PLATFORM_SCHEMAS[platform]
+            schema = get_schema(platform)
             c1, c2 = st.columns([1, 2])
             with c1:
                 st.success(f"✅ **{platform}** と判別")
@@ -666,15 +999,16 @@ elif page == "📥 データ取込":
                 if schema.get("bank_transfer_keywords"):
                     st.info("⚠️ 銀行振込は取込後に手動確認が必要です")
             with c2:
+                fee_rate = st.session_state.platform_fees.get(platform, DEFAULT_PLATFORM_FEES.get(platform, 30.0))
                 info = {
-                    "利用日":  schema["usage_date"],
-                    "店舗名":  schema["store"],
-                    "売上":    schema["amount"],
-                    "返金":    schema["refund"] or "なし",
-                    "割引":    schema["discount"] or "なし",
-                    "手取り":  schema["net_amount"] or "手数料率から計算",
-                    "予約ID":  schema["booking_id"],
-                    "顧客名":  schema["customer"],
+                    "利用日":  schema.get("usage_date") or "なし",
+                    "店舗名":  schema.get("store"),
+                    "売上":    schema.get("amount"),
+                    "返金":    schema.get("refund") or "なし",
+                    "割引":    schema.get("discount") or "なし",
+                    "手取り":  schema.get("net_amount") or f"手数料率 {fee_rate}% から計算",
+                    "予約ID":  schema.get("booking_id") or "自動生成（利用日＋店舗＋金額）",
+                    "顧客名":  schema.get("customer") or "なし",
                     "決済方法": schema.get("payment_method") or "なし",
                 }
                 st.dataframe(pd.DataFrame(info.items(), columns=["項目", "対応列"]),
@@ -691,6 +1025,133 @@ elif page == "📥 データ取込":
                 save_state()
                 _rebuild_cache()
                 st.rerun()
+
+    # ── ✍️ 手入力（CSV出力が無い媒体用）──
+    st.divider()
+    st.subheader("✍️ 手入力で売上を登録")
+    st.caption("よやっぴんのようにCSV出力が無い媒体は、ここから登録します。"
+               "表に直接打ち込むか、管理画面の一覧をコピーして貼り付けてください。")
+
+    mc1, mc2 = st.columns([1, 2])
+    with mc1:
+        m_platform = st.selectbox("媒体", all_platforms(), key="manual_platform")
+    with mc2:
+        m_rate = st.session_state.platform_fees.get(
+            m_platform, DEFAULT_PLATFORM_FEES.get(m_platform, 30.0))
+        st.caption(f"手数料率 **{m_rate}%** で手取りを計算します（設定 → 💳 手数料設定 で変更）。"
+                   "「手取り（振込額）」を入力した行は、その実額を優先します。")
+
+    tab_edit, tab_paste = st.tabs(["⌨️ 表に直接入力", "📋 貼り付けて取込"])
+
+    with tab_edit:
+        edited = st.data_editor(
+            _empty_manual_df(),
+            num_rows="dynamic",
+            use_container_width=True,
+            key="manual_editor",
+            column_config={
+                "利用日": st.column_config.DateColumn("利用日 *", format="YYYY-MM-DD"),
+                "店舗":   st.column_config.SelectboxColumn("店舗 *", options=st.session_state.stores),
+                "顧客名": st.column_config.TextColumn("顧客名"),
+                "売上":   st.column_config.NumberColumn("売上 *", format="%d", min_value=0),
+                "手取り（振込額）": st.column_config.NumberColumn("手取り（振込額）", format="%d", min_value=0),
+                "決済方法": st.column_config.TextColumn("決済方法", help="例: クレジットカード / 現地払い"),
+            },
+        )
+        if st.button("✅ 入力した内容を登録", key="manual_register"):
+            new_cnt, dup_cnt, skipped = register_manual_rows(m_platform, edited)
+            for s in skipped:
+                st.warning(s)
+            if new_cnt > 0:
+                st.success(f"✅ {new_cnt:,} 件を登録しました（重複スキップ: {dup_cnt:,} 件）")
+                save_state()
+                _rebuild_cache()
+                st.rerun()
+            elif dup_cnt > 0:
+                st.warning(f"すべて登録済みでした（{dup_cnt:,} 件）")
+            else:
+                st.info("登録できる行がありませんでした。利用日と売上を入力してください。")
+
+    with tab_paste:
+        st.caption("よやっぴんの予約一覧などをドラッグしてコピー → 下に貼り付け（タブ区切り／カンマ区切り）。"
+                   "貼り付けたあと、どの列が利用日・店舗・売上かを指定します。")
+        pasted    = st.text_area("貼り付け欄", height=150, key="manual_paste",
+                                 placeholder="2026/08/01\t元町駅前店\t山田\t3300\n2026/08/02\t加古川駅前店\t佐藤\t5500")
+        has_head  = st.checkbox("1行目は見出し行", value=True, key="manual_paste_header")
+        df_paste  = parse_pasted_table(pasted, has_head) if pasted.strip() else None
+
+        if df_paste is not None and not df_paste.empty:
+            st.dataframe(df_paste.head(5), use_container_width=True)
+            opts = [NONE_LABEL] + df_paste.columns.tolist()
+
+            def _pick(label, field, required=False):
+                guess = _guess_col(df_paste.columns.tolist(), field)
+                return st.selectbox(f"{label}{' *' if required else ''}", opts,
+                                    index=opts.index(guess) if guess in opts else 0,
+                                    key=f"paste_{field}")
+
+            pc1, pc2, pc3 = st.columns(3)
+            with pc1:
+                c_date  = _pick("利用日", "usage_date", True)
+                c_store = _pick("店舗",   "store", True)
+            with pc2:
+                c_amt   = _pick("売上",   "amount", True)
+                c_net   = _pick("手取り（振込額）", "net_amount")
+            with pc3:
+                c_cust  = _pick("顧客名", "customer")
+                c_pay   = _pick("決済方法", "payment_method")
+
+            fixed_store = None
+            if c_store == NONE_LABEL:
+                fixed_store = st.selectbox("店舗の列が無い場合はここで指定",
+                                           st.session_state.stores, key="paste_fixed_store")
+
+            if st.button("✅ 貼り付けた内容を登録", key="paste_register"):
+                if c_date == NONE_LABEL or c_amt == NONE_LABEL:
+                    st.error("「利用日」と「売上」の列を指定してください。")
+                else:
+                    rows = pd.DataFrame({
+                        "利用日":          df_paste[c_date],
+                        "店舗":            df_paste[c_store] if c_store != NONE_LABEL else fixed_store,
+                        "顧客名":          df_paste[c_cust] if c_cust != NONE_LABEL else "",
+                        "売上":            df_paste[c_amt],
+                        "手取り（振込額）": df_paste[c_net] if c_net != NONE_LABEL else None,
+                        "決済方法":        df_paste[c_pay] if c_pay != NONE_LABEL else "",
+                    }).reset_index(drop=True)
+                    new_cnt, dup_cnt, skipped = register_manual_rows(m_platform, rows)
+                    for s in skipped:
+                        st.warning(s)
+                    if new_cnt > 0:
+                        st.success(f"✅ {new_cnt:,} 件を登録しました（重複スキップ: {dup_cnt:,} 件）")
+                        save_state()
+                        _rebuild_cache()
+                        st.rerun()
+                    elif dup_cnt > 0:
+                        st.warning(f"すべて登録済みでした（{dup_cnt:,} 件）")
+                    else:
+                        st.info("登録できる行がありませんでした。")
+
+    # 手入力データの確認・削除
+    md_manual = st.session_state.master_data
+    if not md_manual.empty and "データ種別" in md_manual.columns:
+        manual_rows = md_manual[md_manual["データ種別"] == "手入力"]
+        if not manual_rows.empty:
+            with st.expander(f"📝 手入力で登録済みのデータ（{len(manual_rows)} 件）・修正／削除", expanded=False):
+                show = manual_rows[[c for c in ["予約ID", "利用日", "月", "プラットフォーム", "店舗",
+                                                "顧客名", "決済方法", "売上", "手数料率", "手取り"]
+                                    if c in manual_rows.columns]]
+                st.dataframe(show.sort_values("利用日", ascending=False),
+                             hide_index=True, use_container_width=True)
+                to_delete = st.multiselect("削除する行（予約ID）", manual_rows["予約ID"].tolist(),
+                                           key="manual_delete_ids")
+                if to_delete and st.button("🗑 選択した手入力データを削除", key="manual_delete_btn"):
+                    st.session_state.master_data = md_manual[
+                        ~((md_manual["データ種別"] == "手入力") & (md_manual["予約ID"].isin(to_delete)))
+                    ].reset_index(drop=True)
+                    save_state()
+                    _rebuild_cache()
+                    st.success(f"{len(to_delete)} 件を削除しました")
+                    st.rerun()
 
     # ── 銀行振込 入金確認 ──
     st.divider()
@@ -1023,7 +1484,9 @@ elif page == "📄 請求書管理":
 elif page == "⚙️ 設定":
     st.title("⚙️ 設定")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏢 店舗管理", "💳 手数料設定", "💰 固定費設定", "🌐 事業全体経費", "🔗 店舗名マッピング"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["🏢 店舗管理", "💳 手数料設定", "💰 固定費設定", "🌐 事業全体経費",
+         "🔗 店舗名マッピング", "📑 CSV形式"])
 
     with tab1:
         st.subheader("店舗名の管理")
@@ -1036,10 +1499,13 @@ elif page == "⚙️ 設定":
 
     with tab2:
         st.subheader("プラットフォーム手数料率 (%)")
-        new_fees = {}
-        for plat in PLATFORMS:
+        st.caption("CSVに手取り（振込額）の列がある媒体は、CSVの実額を優先して手数料を計算します。"
+                   "列が無い媒体（よやクル・よやっぴん・カシカシ等）はここの料率で計算します。")
+        new_fees = dict(st.session_state.platform_fees)
+        for plat in all_platforms():
             new_fees[plat] = st.number_input(
-                plat, value=float(st.session_state.platform_fees.get(plat, 30)),
+                plat, value=float(st.session_state.platform_fees.get(
+                    plat, DEFAULT_PLATFORM_FEES.get(plat, 30.0))),
                 min_value=0.0, max_value=100.0, step=0.1, key=f"fee_{plat}",
             )
         if st.button("手数料を保存", key="save_fees"):
@@ -1091,7 +1557,8 @@ elif page == "⚙️ 設定":
         existing_bc = st.session_state.business_costs.get(bc_key, {})
 
         st.markdown("**経費項目を入力**")
-        bc_items = ["よやクル月額費用", "備品費", "公式LINE", "広告費", "その他"]
+        bc_items = ["よやクル月額費用", "よやっぴん月額費用", "カシカシ月額費用",
+                    "備品費", "公式LINE", "広告費", "その他"]
         bc_vals = {}
         cols = st.columns(2)
         for i, item in enumerate(bc_items):
@@ -1134,7 +1601,7 @@ elif page == "⚙️ 設定":
         st.subheader("プラットフォーム別 店舗名マッピング")
         st.caption("CSV上の店舗名 → 正式店舗名 に変換します。")
         new_mapping = dict(st.session_state.store_mapping)
-        for plat in PLATFORMS:
+        for plat in all_platforms():
             st.markdown(f"**{plat}**")
             for store in st.session_state.stores:
                 pname = st.text_input(
@@ -1173,6 +1640,46 @@ elif page == "⚙️ 設定":
                      "正式店舗名": v}
                     for k, v in st.session_state.store_mapping.items()]
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    with tab6:
+        st.subheader("CSV形式（列マッピング）の管理")
+        st.caption("よやクル・インスタベース・スペースマーケットは組込み済みです。"
+                   "よやっぴん・カシカシなど新しい媒体は、「データ取込」でCSVをアップロードすると"
+                   "列を割り当てる画面が出て、ここに登録されます。")
+
+        st.markdown("**組込み形式（変更不可）**")
+        st.dataframe(
+            pd.DataFrame([{"媒体": p, "判別に使う列": "、".join(s["signature"])}
+                          for p, s in PLATFORM_SCHEMAS.items()]),
+            hide_index=True, use_container_width=True,
+        )
+
+        st.divider()
+        st.markdown("**登録済みの追加形式**")
+        formats = custom_schemas()
+        if not formats:
+            st.info("追加登録された形式はまだありません。"
+                    "よやっぴん／カシカシのCSVを「データ取込」からアップロードして登録してください。")
+        else:
+            label_map = {f: label for f, label, _ in SCHEMA_FIELDS}
+            for plat, sch in formats.items():
+                with st.expander(f"📑 {plat}", expanded=False):
+                    rows = [{"項目": label_map[f], "CSVの列": sch.get(f) or "（なし）"}
+                            for f, _, _ in SCHEMA_FIELDS]
+                    rows.append({"項目": "判別に使う列", "CSVの列": "、".join(sch.get("signature", []))})
+                    if sch.get("bank_transfer_keywords"):
+                        rows.append({"項目": "手動入金確認する決済方法",
+                                     "CSVの列": "、".join(sch["bank_transfer_keywords"])})
+                    if sch.get("usage_date_mmdd"):
+                        rows.append({"項目": "利用日の年", "CSVの列": "支払日から補完（MM/DD形式）"})
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                    if st.button(f"🗑 「{plat}」の形式を削除", key=f"del_fmt_{plat}"):
+                        new_formats = dict(formats)
+                        new_formats.pop(plat, None)
+                        st.session_state.csv_formats = new_formats
+                        save_state()
+                        st.success(f"「{plat}」の形式を削除しました（取込済みの売上データは残ります）")
+                        st.rerun()
 
 
 # ════════════════════════════════════════════════════════════════════════════
