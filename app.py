@@ -517,13 +517,14 @@ MANUAL_COLS = ["利用日", "店舗", "顧客名", "売上", "手取り（振込
 
 
 def _empty_manual_df(rows: int = 5) -> pd.DataFrame:
+    """空欄が「None」と表示されないよう、列ごとに適切な型で空表を作る"""
     return pd.DataFrame({
-        "利用日":          [None] * rows,
-        "店舗":            [None] * rows,
-        "顧客名":          [""]   * rows,
-        "売上":            [None] * rows,
-        "手取り（振込額）": [None] * rows,
-        "決済方法":        [""]   * rows,
+        "利用日":          pd.Series([pd.NaT] * rows, dtype="datetime64[ns]"),
+        "店舗":            pd.Series([None] * rows,   dtype="object"),
+        "顧客名":          pd.Series([""] * rows,     dtype="object"),
+        "売上":            pd.Series([float("nan")] * rows, dtype="float64"),
+        "手取り（振込額）": pd.Series([float("nan")] * rows, dtype="float64"),
+        "決済方法":        pd.Series([""] * rows,     dtype="object"),
     })
 
 
@@ -1034,7 +1035,10 @@ elif page == "📥 データ取込":
 
     mc1, mc2 = st.columns([1, 2])
     with mc1:
-        m_platform = st.selectbox("媒体", all_platforms(), key="manual_platform")
+        # CSV出力が無い媒体で使うことが多いので、よやっぴんがあれば初期選択にする
+        m_options = all_platforms()
+        m_default = m_options.index("よやっぴん") if "よやっぴん" in m_options else 0
+        m_platform = st.selectbox("媒体", m_options, index=m_default, key="manual_platform")
     with mc2:
         m_rate = st.session_state.platform_fees.get(
             m_platform, DEFAULT_PLATFORM_FEES.get(m_platform, 30.0))
