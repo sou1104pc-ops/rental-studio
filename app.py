@@ -17,7 +17,16 @@ INVOICE_PATH = os.path.join(DATA_DIR, "invoice_data.json")
 CONFIG_PATH  = os.path.join(DATA_DIR, "config.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-DATETIME_COLS = ["利用日", "支払日"]
+DATETIME_COLS = ["利用日", "支払日", "未入金確定日"]
+
+# ─── 入金ステータス ──────────────────────────────────────────────────────────
+BAD_DEBT_STATUS = "未入金確定"          # 回収不能として売上から除外するステータス
+PAID_STATUSES   = ("入金済み", "金額不一致")
+DEPOSIT_STATUS_OPTIONS = ["入金済み", "金額不一致", "未入金", "未入金（督促済み）", BAD_DEBT_STATUS]
+DEPOSIT_EXTRA_COLS = {          # 既存データに無ければこの初期値で補完する列
+    "未入金確定日":   None,
+    "未入金確定理由": "",
+}
 
 def _safe_int(v, default=0):
     try:
@@ -257,6 +266,30 @@ MONTH_OPTIONS = (
 )
 
 
+def ensure_deposit_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """入金管理用の列（入金額・入金ステータス・未入金確定日・未入金確定理由）を補完する。
+    既存データを壊さず、無い列だけデフォルト値で足す。"""
+    if df is None or df.empty:
+        return df
+    if "入金額" not in df.columns:
+        df["入金額"] = df.apply(lambda r: r["実売上"] if r.get("確認済み", False) else 0.0, axis=1)
+    if "入金ステータス" not in df.columns:
+        df["入金ステータス"] = df.apply(
+            lambda r: "入金済み" if r.get("確認済み", False) else "未入金", axis=1
+        )
+    for col, default in DEPOSIT_EXTRA_COLS.items():
+        if col not in df.columns:
+            df[col] = pd.NaT if col in DATETIME_COLS else default
+    return df
+
+
+def is_bad_debt(df: pd.DataFrame) -> pd.Series:
+    """未入金確定（貸倒）行を示すブールSeries。"""
+    if df is None or df.empty or "入金ステータス" not in df.columns:
+        return pd.Series([], dtype=bool) if df is None or df.empty else pd.Series(False, index=df.index)
+    return df["入金ステータス"].fillna("") == BAD_DEBT_STATUS
+
+
 # ─── セッション初期化 ────────────────────────────────────────────────────────
 def init_session():
     # まずファイルから復元を試みる
@@ -275,6 +308,9 @@ def init_session():
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+    # 既存データにも入金管理用の列を必ず用意しておく（過去データはそのまま保持）
+    st.session_state.master_data  = ensure_deposit_cols(st.session_state.master_data)
+    st.session_state.invoice_data = ensure_deposit_cols(st.session_state.invoice_data)
 
 
 init_session()
@@ -366,8 +402,18 @@ def _rebuild_cache():
     st.session_state._all_data       = pd.concat(all_frames,       ignore_index=True) if all_frames       else pd.DataFrame()
     st.session_state._confirmed_data = pd.concat(confirmed_frames, ignore_index=True) if confirmed_frames else pd.DataFrame()
     # サイドバー用カウントも更新
-    st.session_state._total_records    = len(st.session_state._all_data)
-    st.session_state._pending_count    = int((~st.session_state._all_data["確認済み"]).sum()) if not st.session_state._all_data.empty and "確認済み" in st.session_state._all_data.columns else 0
+    alld = st.session_state._all_data
+    st.session_state._total_records = len(alld)
+    if not alld.empty and "確認済み" in alld.columns:
+        bad = is_bad_debt(alld)
+        # 未入金確定は「確認待ち」ではないので pending から除外
+        st.session_state._pending_count     = int(((~alld["確認済み"]) & (~bad)).sum())
+        st.session_state._bad_debt_count     = int(bad.sum())
+        st.session_state._bad_debt_amount    = float(alld.loc[bad, "実売上"].sum()) if "実売上" in alld.columns else 0.0
+    else:
+        st.session_state._pending_count  = 0
+        st.session_state._bad_debt_count  = 0
+        st.session_state._bad_debt_amount = 0.0
 
 
 def _normalize_stores(df: pd.DataFrame) -> pd.DataFrame:
@@ -394,6 +440,70 @@ def get_all_data() -> Optional[pd.DataFrame]:
         _rebuild_cache()
     df = _normalize_stores(st.session_state._all_data)
     return df if not df.empty else None
+
+
+def get_bad_debt_data() -> Optional[pd.DataFrame]:
+    """未入金確定（貸倒）データを master / invoice 横断で返す。売上には計上しない。"""
+    frames = []
+    for label, key in (("CSV取込", "master_data"), ("請求書", "invoice_data")):
+        df = st.session_state.get(key)
+        if df is None or df.empty or "入金ステータス" not in df.columns:
+            continue
+        sub = df[is_bad_debt(df)].copy()
+        if sub.empty:
+            continue
+        sub["元データ"] = label
+        sub["元index"]  = sub.index
+        frames.append(sub)
+    if not frames:
+        return None
+    out = _normalize_stores(pd.concat(frames, ignore_index=True))
+    return out if not out.empty else None
+
+
+def set_bad_debt(source_key: str, indices, fix_date, reason: str = "") -> int:
+    """指定行を未入金確定にする。データは削除せず、ステータスだけ変更する。
+    確認済み=False のままなので売上（確認済みデータ）には計上されない。"""
+    df = st.session_state.get(source_key)
+    if df is None or df.empty or not len(indices):
+        return 0
+    df = ensure_deposit_cols(df.copy())
+    for idx in indices:
+        if idx not in df.index:
+            continue
+        df.at[idx, "入金ステータス"] = BAD_DEBT_STATUS
+        df.at[idx, "確認済み"]       = False       # 売上には計上しない
+        df.at[idx, "入金額"]         = 0.0
+        df.at[idx, "未入金確定日"]   = pd.Timestamp(fix_date)
+        df.at[idx, "未入金確定理由"] = reason
+    st.session_state[source_key] = df
+    return len(indices)
+
+
+def unset_bad_debt(source_key: str, indices) -> int:
+    """未入金確定を解除して「未入金」に戻す。"""
+    df = st.session_state.get(source_key)
+    if df is None or df.empty or not len(indices):
+        return 0
+    df = ensure_deposit_cols(df.copy())
+    for idx in indices:
+        if idx not in df.index:
+            continue
+        df.at[idx, "入金ステータス"] = "未入金"
+        df.at[idx, "未入金確定日"]   = pd.NaT
+        df.at[idx, "未入金確定理由"] = ""
+    st.session_state[source_key] = df
+    return len(indices)
+
+
+def bad_debt_label(row) -> str:
+    """選択UI用のラベル。請求書番号 or 予約IDで一意に特定できるようにする。"""
+    def _v(k):
+        v = row.get(k)
+        return "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
+    ident = _v("請求書番号") or _v("予約ID") or "（IDなし）"
+    return (f"{ident}｜{_v('顧客名') or '（顧客名なし）'}"
+            f"｜{_v('店舗')}｜{_v('月')}｜{fmt_yen(row.get('実売上', 0) or 0)}")
 
 
 def detect_platform(cols: list) -> Optional[str]:
@@ -763,7 +873,7 @@ with st.sidebar:
     page = st.radio(
         "ナビゲーション",
         ["📊 ダッシュボード", "🏪 媒体別売上", "📥 データ取込", "📄 請求書管理",
-         "⚙️ 設定", "📈 損益レポート", "👥 顧客分析", "🔍 予約検索"],
+         "🚫 未入金確定", "⚙️ 設定", "📈 損益レポート", "👥 顧客分析", "🔍 予約検索"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -775,6 +885,9 @@ with st.sidebar:
     st.caption(f"総レコード: {total_records:,} 件")
     if pending > 0:
         st.warning(f"入金確認待ち: {pending} 件")
+    bad_cnt = st.session_state.get("_bad_debt_count", 0)
+    if bad_cnt > 0:
+        st.error(f"未入金確定: {bad_cnt} 件 / {fmt_yen(st.session_state.get('_bad_debt_amount', 0))}")
     if st.session_state.get("_storage_mode"):
         st.caption(f"💾 {st.session_state._storage_mode}")
 
@@ -812,32 +925,145 @@ if page == "📊 ダッシュボード":
             st.plotly_chart(fig2, use_container_width=True)
         st.stop()
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("総売上",    fmt_yen(df["売上"].sum()))
-    c2.metric("手数料合計", fmt_yen(df["手数料"].sum()))
-    c3.metric("手取り合計", fmt_yen(df["手取り"].sum()))
-    c4.metric("予約件数",  f"{len(df):,} 件")
+    # ── 期間を選択 ──
+    months_all = sorted([m for m in df["月"].dropna().unique().tolist() if m])
+    if not months_all:
+        st.warning("月が入っているデータがありません。")
+        st.stop()
+
+    this_month = datetime.now().strftime("%Y-%m")
+    this_year  = datetime.now().strftime("%Y")
+
+    st.subheader("📅 期間を選択")
+    preset = st.radio(
+        "期間",
+        ["全期間", "今月", "先月", "直近3ヶ月", "直近6ヶ月", "今年", "カスタム"],
+        index=0, horizontal=True, key="dash_period", label_visibility="collapsed",
+    )
+
+    def _last_n(n: int):
+        past = [m for m in months_all if m <= this_month]
+        base = past if past else months_all
+        return base[-n:][0], base[-1]
+
+    if preset == "全期間":
+        m_start, m_end = months_all[0], months_all[-1]
+    elif preset == "今月":
+        m_start = m_end = this_month
+    elif preset == "先月":
+        prev = (pd.Timestamp(this_month + "-01") - pd.DateOffset(months=1)).strftime("%Y-%m")
+        m_start = m_end = prev
+    elif preset == "直近3ヶ月":
+        m_start, m_end = _last_n(3)
+    elif preset == "直近6ヶ月":
+        m_start, m_end = _last_n(6)
+    elif preset == "今年":
+        in_year = [m for m in months_all if m.startswith(this_year)]
+        m_start, m_end = (in_year[0], in_year[-1]) if in_year else (this_month, this_month)
+    else:  # カスタム
+        m_start, m_end = st.select_slider(
+            "対象月の範囲", options=months_all,
+            value=(months_all[0], months_all[-1]), key="dash_custom_range",
+        )
+
+    dfp = df[(df["月"] >= m_start) & (df["月"] <= m_end)].copy()
+    st.caption(f"対象期間: **{m_start} 〜 {m_end}**　（{len(dfp):,} 件）")
+
+    if dfp.empty:
+        st.warning("この期間に該当するデータがありません。別の期間を選んでください。")
+        st.stop()
+
+    # ── 期間の売上サマリー ──
+    st.divider()
+    st.subheader(f"💰 {m_start} 〜 {m_end} の売上")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("総売上",     fmt_yen(dfp["売上"].sum()))
+    c2.metric("実売上",     fmt_yen(dfp["実売上"].sum()) if "実売上" in dfp.columns else "-")
+    c3.metric("手数料合計", fmt_yen(dfp["手数料"].sum()))
+    c4.metric("手取り合計", fmt_yen(dfp["手取り"].sum()))
+    c5.metric("予約件数",   f"{len(dfp):,} 件")
+
+    _bad_dash = get_bad_debt_data()
+    if _bad_dash is not None:
+        _bad_p = _bad_dash[(_bad_dash["月"] >= m_start) & (_bad_dash["月"] <= m_end)]
+        if not _bad_p.empty:
+            st.caption(f"🚫 この期間の未入金確定（売上に含みません）: "
+                       f"{len(_bad_p)} 件 / {fmt_yen(_bad_p['実売上'].sum())}")
+
+    # ── それぞれの売上（内訳）──
+    def breakdown(key: str) -> pd.DataFrame:
+        agg_cols = {"売上": ("売上", "sum"), "手数料": ("手数料", "sum"),
+                    "手取り": ("手取り", "sum"), "件数": ("売上", "count")}
+        if "実売上" in dfp.columns:
+            agg_cols["実売上"] = ("実売上", "sum")
+        out = dfp.groupby(key).agg(**agg_cols).reset_index()
+        total_sales = out["売上"].sum()
+        out["構成比"] = (out["売上"] / total_sales * 100).round(1) if total_sales else 0.0
+        cols = [key, "売上"] + (["実売上"] if "実売上" in out.columns else []) + \
+               ["手数料", "手取り", "件数", "構成比"]
+        return out[cols].sort_values("売上", ascending=False)
+
+    def show_breakdown(bk: pd.DataFrame):
+        money = {c: fmt_yen for c in ["売上", "実売上", "手数料", "手取り"] if c in bk.columns}
+        st.dataframe(bk.style.format({**money, "構成比": "{:.1f}%"}),
+                     hide_index=True, use_container_width=True)
 
     st.divider()
+    st.subheader("📋 内訳（この期間のそれぞれの売上）")
+    bd_tabs = ["🏪 店舗別", "📱 媒体別", "🏪×📱 店舗×媒体", "📅 月別"]
+    if "決済方法" in dfp.columns:
+        bd_tabs.append("💳 決済方法別")
+    tabs = st.tabs(bd_tabs)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        fig = px.bar(df.groupby(["月", "店舗"])["売上"].sum().reset_index(),
-                     x="月", y="売上", color="店舗", title="月別・店舗別売上", barmode="group")
-        st.plotly_chart(fig, use_container_width=True)
-    with c2:
-        fig2 = px.pie(df.groupby("プラットフォーム")["売上"].sum().reset_index(),
-                      values="売上", names="プラットフォーム", title="プラットフォーム別売上")
-        st.plotly_chart(fig2, use_container_width=True)
+    with tabs[0]:
+        bk_store = breakdown("店舗")
+        show_breakdown(bk_store)
+        st.plotly_chart(px.bar(bk_store, x="店舗", y="売上", title=f"店舗別売上（{m_start}〜{m_end}）"),
+                        use_container_width=True)
+    with tabs[1]:
+        bk_plat = breakdown("プラットフォーム")
+        show_breakdown(bk_plat)
+        st.plotly_chart(px.pie(bk_plat, values="売上", names="プラットフォーム",
+                               title=f"媒体別売上（{m_start}〜{m_end}）"),
+                        use_container_width=True)
+    with tabs[2]:
+        cross = dfp.pivot_table(index="店舗", columns="プラットフォーム", values="売上",
+                                aggfunc="sum", fill_value=0, margins=True, margins_name="合計")
+        st.dataframe(cross.style.format(fmt_yen), use_container_width=True)
+    with tabs[3]:
+        bk_month = breakdown("月").sort_values("月")
+        show_breakdown(bk_month)
+        st.plotly_chart(px.bar(dfp.groupby(["月", "店舗"])["売上"].sum().reset_index(),
+                               x="月", y="売上", color="店舗",
+                               title="月別・店舗別売上", barmode="group"),
+                        use_container_width=True)
+        st.plotly_chart(px.bar(dfp.groupby(["月", "プラットフォーム"])["売上"].sum().reset_index(),
+                               x="月", y="売上", color="プラットフォーム",
+                               title="月別・媒体別売上"),
+                        use_container_width=True)
+    if "決済方法" in dfp.columns:
+        with tabs[4]:
+            bk_pay = breakdown("決済方法")
+            show_breakdown(bk_pay)
+            st.plotly_chart(px.pie(bk_pay, values="売上", names="決済方法",
+                                   title=f"決済方法別売上（{m_start}〜{m_end}）"),
+                            use_container_width=True)
 
-    fig3 = px.bar(df.groupby(["月", "プラットフォーム"])["売上"].sum().reset_index(),
-                  x="月", y="売上", color="プラットフォーム", title="月別・プラットフォーム別売上")
-    st.plotly_chart(fig3, use_container_width=True)
-
-    if "決済方法" in df.columns:
-        fig4 = px.pie(df.groupby("決済方法")["売上"].sum().reset_index(),
-                      values="売上", names="決済方法", title="決済方法別売上")
-        st.plotly_chart(fig4, use_container_width=True)
+    # ── 期間データの書き出し ──
+    st.divider()
+    with st.expander("📤 この期間の集計をダウンロード", expanded=False):
+        pbuf = io.BytesIO()
+        with pd.ExcelWriter(pbuf, engine="openpyxl") as writer:
+            breakdown("月").sort_values("月").to_excel(writer, sheet_name="月別", index=False)
+            breakdown("店舗").to_excel(writer, sheet_name="店舗別", index=False)
+            breakdown("プラットフォーム").to_excel(writer, sheet_name="媒体別", index=False)
+            if "決済方法" in dfp.columns:
+                breakdown("決済方法").to_excel(writer, sheet_name="決済方法別", index=False)
+            dfp.to_excel(writer, sheet_name="明細", index=False)
+        st.download_button(
+            "📊 Excelをダウンロード", data=pbuf.getvalue(),
+            file_name=f"売上_{m_start}_{m_end}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1155,23 +1381,35 @@ elif page == "📥 データ取込":
     st.divider()
     st.subheader("🏦 銀行振込 入金確認")
 
-    md = st.session_state.master_data
-    # 既存データに新カラムがない場合はデフォルト値で補完
-    if not md.empty:
-        if "入金額" not in md.columns:
-            md["入金額"] = md.apply(lambda r: r["実売上"] if r.get("確認済み", False) else 0.0, axis=1)
-        if "入金ステータス" not in md.columns:
-            md["入金ステータス"] = md.apply(
-                lambda r: "入金済み" if r.get("確認済み", False) else "未入金", axis=1
-            )
-        st.session_state.master_data = md
+    md = ensure_deposit_cols(st.session_state.master_data)
+    st.session_state.master_data = md
 
     if not md.empty and "確認済み" in md.columns:
-        pending = md[(md["確認済み"] == False) & (md["データ種別"] == "CSV")]
+        # 未入金確定（貸倒）にしたものは確認待ちから外し、「🚫 未入金確定」ページで管理する
+        pending = md[(md["確認済み"] == False) & (md["データ種別"] == "CSV") & (~is_bad_debt(md))]
         if pending.empty:
             st.success("未確認の銀行振込はありません")
         else:
             st.warning(f"入金確認待ち: {len(pending)} 件")
+
+            # ── まとめて未入金確定にする ──
+            with st.expander(f"🚫 まとめて未入金確定にする（{len(pending)} 件から選択）", expanded=False):
+                st.caption("ずっと入金されない予約を選んで確定します。データは削除されず、"
+                           "売上（確認済みデータ）には計上されません。あとから解除もできます。")
+                label_map = {bad_debt_label(r): i for i, r in pending.iterrows()}
+                picked = st.multiselect("未入金確定にする予約", list(label_map.keys()), key="md_bad_pick")
+                bc1, bc2 = st.columns([1, 2])
+                with bc1:
+                    bad_date = st.date_input("確定日", value=datetime.now().date(), key="md_bad_date")
+                with bc2:
+                    bad_reason = st.text_input("理由・メモ（任意）", placeholder="例: 連絡つかず／督促3回", key="md_bad_reason")
+                if picked and st.button(f"🚫 選択した {len(picked)} 件を未入金確定にする", key="md_bad_btn"):
+                    n = set_bad_debt("master_data", [label_map[l] for l in picked], bad_date, bad_reason)
+                    save_state()
+                    _rebuild_cache()
+                    st.success(f"{n} 件を未入金確定にしました")
+                    st.rerun()
+
             for idx, row in pending.iterrows():
                 c1, c2 = st.columns([4, 2])
                 with c1:
@@ -1191,8 +1429,9 @@ elif page == "📥 データ取込":
                     with ec2:
                         deposit_status = st.selectbox(
                             "入金ステータス",
-                            ["入金済み", "金額不一致", "未入金", "未入金（督促済み）"],
+                            DEPOSIT_STATUS_OPTIONS,
                             index=0, key=f"md_status_{idx}",
+                            help="「未入金確定」は回収不能として確定させる状態です（売上には計上されません）",
                         )
                     with ec3:
                         deposit_date = st.date_input("入金日", value=datetime.now().date(), key=f"md_depdate_{idx}")
@@ -1202,15 +1441,19 @@ elif page == "📥 データ取込":
                         st.info(f"売上額との差額: {fmt_yen(diff)}")
 
                     if st.button("✅ 入金確認して保存", key=f"confirm_{idx}"):
-                        st.session_state.master_data.at[idx, "入金額"] = float(deposit)
-                        st.session_state.master_data.at[idx, "入金ステータス"] = deposit_status
-                        st.session_state.master_data.at[idx, "支払日"] = pd.Timestamp(deposit_date)
-                        # 入金があった（入金済み／金額不一致）ものは確認済みにして売上へ反映
-                        if deposit_status in ("入金済み", "金額不一致"):
-                            st.session_state.master_data.at[idx, "確認済み"] = True
-                            st.session_state.master_data.at[idx, "手取り"] = float(deposit)
+                        if deposit_status == BAD_DEBT_STATUS:
+                            set_bad_debt("master_data", [idx], deposit_date, "")
                         else:
-                            st.session_state.master_data.at[idx, "確認済み"] = False
+                            st.session_state.master_data.at[idx, "入金額"] = float(deposit)
+                            st.session_state.master_data.at[idx, "入金ステータス"] = deposit_status
+                            st.session_state.master_data.at[idx, "支払日"] = pd.Timestamp(deposit_date)
+                            st.session_state.master_data.at[idx, "未入金確定日"] = pd.NaT
+                            # 入金があった（入金済み／金額不一致）ものは確認済みにして売上へ反映
+                            if deposit_status in PAID_STATUSES:
+                                st.session_state.master_data.at[idx, "確認済み"] = True
+                                st.session_state.master_data.at[idx, "手取り"] = float(deposit)
+                            else:
+                                st.session_state.master_data.at[idx, "確認済み"] = False
                         save_state()
                         _rebuild_cache()
                         st.rerun()
@@ -1321,6 +1564,8 @@ elif page == "📄 請求書管理":
                     "データ種別":     "請求書",
                     "確認済み":       False,
                     "入金ステータス": "未入金",
+                    "未入金確定日":   pd.NaT,
+                    "未入金確定理由": "",
                     "備考":           inv_note,
                 }])
                 existing_inv = st.session_state.invoice_data
@@ -1340,24 +1585,39 @@ elif page == "📄 請求書管理":
                     st.rerun()
 
     with tab_list:
-        inv = st.session_state.invoice_data
-        # 既存データに新カラムがない場合はデフォルト値で補完
-        if not inv.empty:
-            if "入金額" not in inv.columns:
-                inv["入金額"] = inv.apply(lambda r: r["実売上"] if r.get("確認済み", False) else 0.0, axis=1)
-            if "入金ステータス" not in inv.columns:
-                inv["入金ステータス"] = inv.apply(
-                    lambda r: "入金済み" if r.get("確認済み", False) else "未入金", axis=1
-                )
-            st.session_state.invoice_data = inv
+        inv = ensure_deposit_cols(st.session_state.invoice_data)
+        st.session_state.invoice_data = inv
 
         if inv.empty:
             st.info("請求書データがありません。「請求書登録」タブから追加してください。")
         else:
-            # ── 未入金一覧 ──
-            pending_inv = inv[inv["確認済み"] == False]
+            # ── 未入金一覧（未入金確定にしたものは「🚫 未入金確定」ページで管理）──
+            pending_inv = inv[(inv["確認済み"] == False) & (~is_bad_debt(inv))]
+            bad_inv     = inv[is_bad_debt(inv)]
+            if not bad_inv.empty:
+                st.error(f"🚫 未入金確定: {len(bad_inv)} 件 / {fmt_yen(bad_inv['実売上'].sum())}"
+                         "（「🚫 未入金確定」ページで一覧・解除できます）")
             if not pending_inv.empty:
                 st.subheader(f"🔴 入金未確認 ({len(pending_inv)} 件)")
+
+                # ── まとめて未入金確定にする ──
+                with st.expander(f"🚫 まとめて未入金確定にする（{len(pending_inv)} 件から選択）", expanded=False):
+                    st.caption("ずっと入金されない請求書を選んで確定します。データは削除されず、"
+                               "売上（確認済みデータ）には計上されません。あとから解除もできます。")
+                    label_map = {bad_debt_label(r): i for i, r in pending_inv.iterrows()}
+                    picked = st.multiselect("未入金確定にする請求書", list(label_map.keys()), key="inv_bad_pick")
+                    bc1, bc2 = st.columns([1, 2])
+                    with bc1:
+                        bad_date = st.date_input("確定日", value=datetime.now().date(), key="inv_bad_date")
+                    with bc2:
+                        bad_reason = st.text_input("理由・メモ（任意）", placeholder="例: 連絡つかず／督促3回", key="inv_bad_reason")
+                    if picked and st.button(f"🚫 選択した {len(picked)} 件を未入金確定にする", key="inv_bad_btn"):
+                        n = set_bad_debt("invoice_data", [label_map[l] for l in picked], bad_date, bad_reason)
+                        save_state()
+                        _rebuild_cache()
+                        st.success(f"{n} 件を未入金確定にしました")
+                        st.rerun()
+
                 for idx, row in pending_inv.iterrows():
                     c1, c2, c3 = st.columns([3, 2, 2])
                     c1.write(f"**{row['請求書番号']}**　{row['顧客名']}")
@@ -1376,21 +1636,26 @@ elif page == "📄 請求書管理":
                         with ec2:
                             deposit_status = st.selectbox(
                                 "入金ステータス",
-                                ["入金済み", "金額不一致", "未入金", "未入金（督促済み）"],
+                                DEPOSIT_STATUS_OPTIONS,
                                 index=0, key=f"inv_status_{idx}",
+                                help="「未入金確定」は回収不能として確定させる状態です（売上には計上されません）",
                             )
                         deposit_date = st.date_input("入金日", value=datetime.now().date(), key=f"inv_depdate_{idx}")
 
                         if st.button("✅ 入金確認して保存", key=f"inv_confirm_{idx}"):
-                            st.session_state.invoice_data.at[idx, "入金額"] = float(deposit)
-                            st.session_state.invoice_data.at[idx, "入金ステータス"] = deposit_status
-                            st.session_state.invoice_data.at[idx, "支払日"] = pd.Timestamp(deposit_date)
-                            # 入金があった（入金済み／金額不一致）ものは確認済みにして売上へ反映
-                            if deposit_status in ("入金済み", "金額不一致"):
-                                st.session_state.invoice_data.at[idx, "確認済み"] = True
-                                st.session_state.invoice_data.at[idx, "手取り"] = float(deposit)
+                            if deposit_status == BAD_DEBT_STATUS:
+                                set_bad_debt("invoice_data", [idx], deposit_date, "")
                             else:
-                                st.session_state.invoice_data.at[idx, "確認済み"] = False
+                                st.session_state.invoice_data.at[idx, "入金額"] = float(deposit)
+                                st.session_state.invoice_data.at[idx, "入金ステータス"] = deposit_status
+                                st.session_state.invoice_data.at[idx, "支払日"] = pd.Timestamp(deposit_date)
+                                st.session_state.invoice_data.at[idx, "未入金確定日"] = pd.NaT
+                                # 入金があった（入金済み／金額不一致）ものは確認済みにして売上へ反映
+                                if deposit_status in PAID_STATUSES:
+                                    st.session_state.invoice_data.at[idx, "確認済み"] = True
+                                    st.session_state.invoice_data.at[idx, "手取り"] = float(deposit)
+                                else:
+                                    st.session_state.invoice_data.at[idx, "確認済み"] = False
                             save_state()
                             _rebuild_cache()
                             st.rerun()
@@ -1458,7 +1723,8 @@ elif page == "📄 請求書管理":
             # ── 全請求書一覧テーブル ──
             st.divider()
             st.subheader("📋 全請求書一覧")
-            show_cols = [c for c in ["請求書番号", "月", "店舗", "顧客名", "実売上", "入金額", "入金ステータス", "確認済み", "備考"]
+            show_cols = [c for c in ["請求書番号", "月", "店舗", "顧客名", "実売上", "入金額", "入金ステータス",
+                                     "未入金確定日", "確認済み", "備考"]
                          if c in inv.columns]
             fmt_dict = {"実売上": fmt_yen}
             if "入金額" in inv.columns:
@@ -1473,6 +1739,179 @@ elif page == "📄 請求書管理":
                 st.session_state.invoice_data = pd.DataFrame()
                 save_state()
                 _rebuild_cache()
+                st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🚫 未入金確定
+# ════════════════════════════════════════════════════════════════════════════
+elif page == "🚫 未入金確定":
+    st.title("🚫 未入金確定")
+    st.caption("ずっと入金されないまま回収できなかった分をまとめた一覧です。"
+               "**売上（ダッシュボード・損益レポート）には計上されません。**"
+               "元データは削除せずそのまま残っているので、入金があればいつでも解除できます。")
+
+    BAD_DETAIL_COLS = ["元データ", "請求書番号", "予約ID", "月", "利用日", "店舗", "顧客名",
+                       "プラットフォーム", "決済方法", "実売上", "未入金確定日", "未入金確定理由", "備考"]
+
+    tab_bad, tab_add = st.tabs(["🚫 未入金確定 一覧", "➕ 未入金から確定する"])
+
+    # ── 一覧 ──
+    with tab_bad:
+        bad = get_bad_debt_data()
+        if bad is None:
+            st.success("未入金確定にしたデータはありません。")
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("未入金確定 件数", f"{len(bad):,} 件")
+            c2.metric("未入金確定 合計額", fmt_yen(bad["実売上"].sum()))
+            c3.metric("対象顧客数", f"{bad['顧客名'].fillna('（不明）').nunique():,} 人")
+
+            st.divider()
+            sc1, sc2 = st.columns(2)
+            by_store = (bad.groupby("店舗")
+                           .agg(件数=("実売上", "count"), 未入金確定額=("実売上", "sum"))
+                           .reset_index().sort_values("未入金確定額", ascending=False))
+            by_month = (bad.groupby("月")
+                           .agg(件数=("実売上", "count"), 未入金確定額=("実売上", "sum"))
+                           .reset_index().sort_values("月"))
+            with sc1:
+                st.subheader("🏪 店舗別")
+                st.dataframe(by_store.style.format({"未入金確定額": fmt_yen}),
+                             hide_index=True, use_container_width=True)
+            with sc2:
+                st.subheader("📅 月別")
+                st.dataframe(by_month.style.format({"未入金確定額": fmt_yen}),
+                             hide_index=True, use_container_width=True)
+            if not by_month.empty:
+                st.plotly_chart(
+                    px.bar(by_month, x="月", y="未入金確定額", title="月別 未入金確定額"),
+                    use_container_width=True)
+
+            bad_cust = bad.copy()
+            bad_cust["顧客名"] = bad_cust["顧客名"].fillna("（不明）").replace("", "（不明）")
+            by_customer = (bad_cust.groupby("顧客名")
+                                   .agg(件数=("実売上", "count"), 未入金確定額=("実売上", "sum"))
+                                   .reset_index().sort_values("未入金確定額", ascending=False))
+            st.subheader("👥 顧客別")
+            st.dataframe(by_customer.style.format({"未入金確定額": fmt_yen}),
+                         hide_index=True, use_container_width=True)
+
+            st.divider()
+            st.subheader("📋 明細一覧")
+            detail = bad[[c for c in BAD_DETAIL_COLS if c in bad.columns]].copy()
+            st.dataframe(detail.style.format({"実売上": fmt_yen}),
+                         hide_index=True, use_container_width=True)
+
+            # ── スプレッドシート出力 ──
+            st.divider()
+            st.subheader("📤 スプレッドシートに出力")
+            st.caption("Excel（複数シート）またはCSVでダウンロードできます。"
+                       "Googleスプレッドシートには、ダウンロードしたファイルをそのままインポートしてください。")
+            dl1, dl2 = st.columns(2)
+            xbuf = io.BytesIO()
+            with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
+                detail.to_excel(writer,      sheet_name="未入金確定_明細",   index=False)
+                by_store.to_excel(writer,    sheet_name="未入金確定_店舗別", index=False)
+                by_month.to_excel(writer,    sheet_name="未入金確定_月別",   index=False)
+                by_customer.to_excel(writer, sheet_name="未入金確定_顧客別", index=False)
+            with dl1:
+                st.download_button(
+                    "📊 Excelをダウンロード", data=xbuf.getvalue(),
+                    file_name=f"未入金確定_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True)
+            with dl2:
+                st.download_button(
+                    "📄 CSVをダウンロード",
+                    data=detail.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"未入金確定_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv", use_container_width=True)
+
+            # ── 解除 ──
+            st.divider()
+            st.subheader("↩️ 未入金確定を解除する")
+            st.caption("あとから入金があった場合は解除して「未入金」に戻し、入金確認から売上に計上してください。")
+            rel_map = {f"[{r['元データ']}] {bad_debt_label(r)}": (r["元データ"], r["元index"])
+                       for _, r in bad.iterrows()}
+            rel_picked = st.multiselect("解除する行", list(rel_map.keys()), key="bad_release_pick")
+            if rel_picked and st.button(f"↩️ 選択した {len(rel_picked)} 件を解除", key="bad_release_btn"):
+                for src_label, idx in [rel_map[l] for l in rel_picked]:
+                    key = "master_data" if src_label == "CSV取込" else "invoice_data"
+                    unset_bad_debt(key, [idx])
+                save_state()
+                _rebuild_cache()
+                st.success(f"{len(rel_picked)} 件の未入金確定を解除しました")
+                st.rerun()
+
+    # ── 未入金から確定する ──
+    with tab_add:
+        st.subheader("未入金のまま残っているデータ")
+        st.caption("CSV取込分（銀行振込など入金確認待ち）と請求書分の未入金をまとめて表示します。")
+
+        sources = []
+        for label, key in (("CSV取込", "master_data"), ("請求書", "invoice_data")):
+            df_src = st.session_state.get(key)
+            if df_src is None or df_src.empty or "確認済み" not in df_src.columns:
+                continue
+            sub = df_src[(df_src["確認済み"] == False) & (~is_bad_debt(df_src))].copy()
+            if sub.empty:
+                continue
+            sub["元データ"] = label
+            sub["元index"]  = sub.index
+            sub["_key"]     = key
+            sources.append(sub)
+
+        if not sources:
+            st.success("未入金のデータはありません。")
+        else:
+            unpaid = pd.concat(sources, ignore_index=True)
+            st.info(f"未入金: {len(unpaid)} 件 / 合計 {fmt_yen(unpaid['実売上'].sum())}")
+
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                f_store = st.multiselect("店舗で絞り込み", sorted(unpaid["店舗"].dropna().unique().tolist()),
+                                         key="bad_add_store")
+            with fc2:
+                f_month = st.multiselect("月で絞り込み", sorted(unpaid["月"].dropna().unique().tolist()),
+                                         key="bad_add_month")
+            view = unpaid
+            if f_store:
+                view = view[view["店舗"].isin(f_store)]
+            if f_month:
+                view = view[view["月"].isin(f_month)]
+
+            st.dataframe(
+                view[[c for c in ["元データ", "請求書番号", "予約ID", "月", "利用日", "店舗", "顧客名",
+                                  "決済方法", "実売上", "入金ステータス"] if c in view.columns]]
+                    .style.format({"実売上": fmt_yen}),
+                hide_index=True, use_container_width=True)
+
+            st.divider()
+            add_map    = {f"[{r['元データ']}] {bad_debt_label(r)}": (r["_key"], r["元index"])
+                          for _, r in view.iterrows()}
+            add_amounts = {f"[{r['元データ']}] {bad_debt_label(r)}": float(r["実売上"] or 0)
+                          for _, r in view.iterrows()}
+            picked = st.multiselect("未入金確定にする行を選択", list(add_map.keys()), key="bad_add_pick")
+            ac1, ac2 = st.columns([1, 2])
+            with ac1:
+                add_date = st.date_input("確定日", value=datetime.now().date(), key="bad_add_date")
+            with ac2:
+                add_reason = st.text_input("理由・メモ（任意）", placeholder="例: 連絡つかず／督促3回", key="bad_add_reason")
+
+            if picked:
+                sel_amount = sum(add_amounts[l] for l in picked)
+                st.warning(f"選択中: {len(picked)} 件 / 合計 {fmt_yen(sel_amount)} を未入金確定にします（売上には計上されません）")
+            if picked and st.button(f"🚫 選択した {len(picked)} 件を未入金確定にする", key="bad_add_btn"):
+                grouped = {}
+                for src_key, idx in [add_map[l] for l in picked]:
+                    grouped.setdefault(src_key, []).append(idx)
+                total = 0
+                for src_key, idxs in grouped.items():
+                    total += set_bad_debt(src_key, idxs, add_date, add_reason)
+                save_state()
+                _rebuild_cache()
+                st.success(f"{total} 件を未入金確定にしました")
                 st.rerun()
 
 
@@ -1691,9 +2130,15 @@ elif page == "📈 損益レポート":
         st.warning("確認済みデータがありません。データ取込・請求書管理から登録してください。")
         st.stop()
 
-    pending_count = len(st.session_state.master_data[st.session_state.master_data["確認済み"] == False]) if not st.session_state.master_data.empty else 0
+    _md_pl = st.session_state.master_data
+    pending_count = int(((_md_pl["確認済み"] == False) & (~is_bad_debt(_md_pl))).sum()) if not _md_pl.empty else 0
     if pending_count > 0:
         st.info(f"ℹ️ 銀行振込の入金未確認が {pending_count} 件あります。確認後に売上へ反映されます。")
+
+    bad_pl = get_bad_debt_data()
+    if bad_pl is not None:
+        st.error(f"🚫 未入金確定（貸倒）: {len(bad_pl)} 件 / {fmt_yen(bad_pl['実売上'].sum())} "
+                 "　※ 下記の損益には含まれていません（Excelには専用シートで出力されます）")
 
     monthly = (
         df.groupby(["月", "店舗"])
@@ -1798,6 +2243,16 @@ elif page == "📈 損益レポート":
             total.to_excel(writer,   sheet_name="事業全体損益", index=False)
             monthly.to_excel(writer, sheet_name="店舗別損益",   index=False)
             df.to_excel(writer,      sheet_name="明細データ",   index=False)
+            # 未入金確定（貸倒）は売上に含めないので、参考として別シートに出力する
+            if bad_pl is not None:
+                bad_cols = [c for c in ["元データ", "請求書番号", "予約ID", "月", "利用日", "店舗", "顧客名",
+                                        "プラットフォーム", "決済方法", "実売上", "未入金確定日",
+                                        "未入金確定理由", "備考"] if c in bad_pl.columns]
+                bad_pl[bad_cols].to_excel(writer, sheet_name="未入金確定_明細", index=False)
+                (bad_pl.groupby(["月", "店舗"])
+                       .agg(件数=("実売上", "count"), 未入金確定額=("実売上", "sum"))
+                       .reset_index()
+                       .to_excel(writer, sheet_name="未入金確定_サマリー", index=False))
         st.download_button(
             label="📊 Excelをダウンロード",
             data=buf.getvalue(),
