@@ -522,6 +522,11 @@ def bad_debt_label(row) -> str:
             f"｜{_v('店舗')}｜{_v('月')}｜{fmt_yen(row.get('実売上', 0) or 0)}")
 
 
+def _no_month_mask(df: pd.DataFrame) -> pd.Series:
+    """「月」が空（日付が読めなかった）行のブールSeries"""
+    return df["月"].isna() | df["月"].astype(str).isin(["", "NaT", "None", "nan"])
+
+
 def detect_platform(cols: list) -> Optional[str]:
     # 組込みスキーマ → 手動登録スキーマ の順に判定
     for platform, schema in {**PLATFORM_SCHEMAS, **custom_schemas()}.items():
@@ -645,18 +650,15 @@ def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
     dp = dp.dropna(subset=["売上"])
 
     existing = st.session_state.master_data
-    if not existing.empty and "月" in existing.columns:
-        # 以前の取込で日付が読めず「月」が空のまま登録された行は、今回の行で置き換える。
-        # 併せて、過去に誤って取り込まれた「合計」行（予約IDなし・月なし）も掃除する。
-        no_month = existing["月"].isna() | existing["月"].astype(str).isin(["", "NaT", "None", "nan"])
-        same_plat = existing["プラットフォーム"] == platform
-        ids = set(dp["予約ID"].astype(str))
-        # 旧取込では予約IDが「123.0」になっていることがあるので末尾の .0 を外して照合
-        old_ids = existing["予約ID"].astype(str).str.replace(r"\.0$", "", regex=True)
-        stale = same_plat & no_month & (
-            old_ids.isin(ids) | old_ids.isin(["", "nan", "None"]))
+    removed = 0
+    if not existing.empty and "月" in existing.columns and dp["月"].notna().any():
+        # 以前の取込で日付が読めず「月」が空のまま登録された同じ媒体の行（合計行を含む）は
+        # 月別の表に出せない壊れたデータなので、正しく読めた今回の取込で置き換える
+        stale = (existing["プラットフォーム"] == platform) & _no_month_mask(existing)
+        removed = int(stale.sum())
         existing = existing[~stale].reset_index(drop=True)
         st.session_state.master_data = existing
+    st.session_state._last_import_removed = removed
 
     if existing.empty:
         merged = dp
@@ -1146,12 +1148,22 @@ elif page == "🏪 媒体別売上":
                    + "、".join(unconfigured))
 
     # 日付が読めず「月」が空の行は月別の表に出ないので、件数を知らせる
-    _no_month = df["月"].isna() | df["月"].astype(str).isin(["", "NaT", "None", "nan"])
+    _no_month = _no_month_mask(df)
     if _no_month.any():
         _nm = df[_no_month].groupby("プラットフォーム")[metric_label].agg(["count", "sum"])
         st.warning("⚠️ 利用日が読めず月別の表に入っていないデータがあります（上部の合計には含まれます）："
                    + "、".join(f"{p} {int(r['count'])}件 {fmt_yen(r['sum'])}" for p, r in _nm.iterrows())
-                   + "　→「データ取込」で同じCSVを取込み直すと正しい月に入ります。")
+                   + "　→「データ取込」でその媒体のCSVを取込み直すと、この行は削除され正しい月で登録されます。")
+        with st.expander("月が空のデータを確認・削除する"):
+            st.dataframe(df[_no_month], use_container_width=True)
+            if st.button("🗑️ 月が空のデータを削除する", key="del_no_month"):
+                for _k in ("master_data", "invoice_data"):
+                    _d = st.session_state[_k]
+                    if not _d.empty and "月" in _d.columns:
+                        st.session_state[_k] = _d[~_no_month_mask(_d)].reset_index(drop=True)
+                save_state()
+                _rebuild_cache()
+                st.rerun()
 
     def pivot_store_platform(d: pd.DataFrame) -> pd.DataFrame:
         """月（行）× プラットフォーム（列）の売上クロス集計。合計行・列付き。"""
@@ -1220,6 +1232,9 @@ elif page == "📥 データ取込":
     st.caption("CSVをアップロードするとプラットフォームを自動判別します。重複は予約ID/決済IDで自動スキップ。"
                "未対応の媒体（よやっぴん・カシカシ等）は、その場で列を割り当てれば取込＆次回から自動判別されます。")
 
+    if st.session_state.get("_import_msg"):
+        st.success("✅ " + st.session_state.pop("_import_msg"))
+
     # ── CSV アップロード ──
     uploaded_files = st.file_uploader(
         "CSVファイルをアップロード（複数可）",
@@ -1287,10 +1302,11 @@ elif page == "📥 データ取込":
 
             if st.button("✅ このCSVを取込む", key=f"import_{uploaded.name}"):
                 new_cnt, dup_cnt = process_csv(df_raw, platform)
-                if new_cnt > 0:
-                    st.success(f"✅ {new_cnt:,} 件を登録（重複スキップ: {dup_cnt:,} 件）")
-                else:
-                    st.warning(f"新規データなし（全 {dup_cnt:,} 件が登録済み）")
+                removed = st.session_state.get("_last_import_removed", 0)
+                msg = f"{uploaded.name}: {platform} {new_cnt:,} 件を登録（重複スキップ: {dup_cnt:,} 件）"
+                if removed:
+                    msg += f"／日付が読めていなかった旧データ {removed:,} 件を置き換え"
+                st.session_state._import_msg = msg
                 save_state()
                 _rebuild_cache()
                 st.rerun()
