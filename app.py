@@ -651,9 +651,10 @@ def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
         no_month = existing["月"].isna() | existing["月"].astype(str).isin(["", "NaT", "None", "nan"])
         same_plat = existing["プラットフォーム"] == platform
         ids = set(dp["予約ID"].astype(str))
+        # 旧取込では予約IDが「123.0」になっていることがあるので末尾の .0 を外して照合
+        old_ids = existing["予約ID"].astype(str).str.replace(r"\.0$", "", regex=True)
         stale = same_plat & no_month & (
-            existing["予約ID"].astype(str).isin(ids)
-            | existing["予約ID"].astype(str).isin(["", "nan", "None"]))
+            old_ids.isin(ids) | old_ids.isin(["", "nan", "None"]))
         existing = existing[~stale].reset_index(drop=True)
         st.session_state.master_data = existing
 
@@ -1143,6 +1144,14 @@ elif page == "🏪 媒体別売上":
     if unconfigured:
         st.caption("⚠️ 設定の店舗一覧に未登録ですが、データに売上がある店舗も表示しています："
                    + "、".join(unconfigured))
+
+    # 日付が読めず「月」が空の行は月別の表に出ないので、件数を知らせる
+    _no_month = df["月"].isna() | df["月"].astype(str).isin(["", "NaT", "None", "nan"])
+    if _no_month.any():
+        _nm = df[_no_month].groupby("プラットフォーム")[metric_label].agg(["count", "sum"])
+        st.warning("⚠️ 利用日が読めず月別の表に入っていないデータがあります（上部の合計には含まれます）："
+                   + "、".join(f"{p} {int(r['count'])}件 {fmt_yen(r['sum'])}" for p, r in _nm.iterrows())
+                   + "　→「データ取込」で同じCSVを取込み直すと正しい月に入ります。")
 
     def pivot_store_platform(d: pd.DataFrame) -> pd.DataFrame:
         """月（行）× プラットフォーム（列）の売上クロス集計。合計行・列付き。"""
