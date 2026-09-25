@@ -179,7 +179,7 @@ DEFAULT_PLATFORM_FEES = {
     "インスタベース":   30.0,
     "スペースマーケット": 30.0,
     "よやっぴん":       30.0,   # ← 実際の料率は「設定 → 手数料設定」で変更してください
-    "カシカシ":         30.0,   # ← 同上
+    "カシカシ":         25.0,   # CSVの「手数料率」列より（オーナー収益列があればそちらを優先）
 }
 
 # ─── プラットフォーム自動検出スキーマ ──────────────────────────────────────────
@@ -224,6 +224,23 @@ PLATFORM_SCHEMAS = {
         "customer":       "ゲスト名",
         "net_amount":     "振込予定金額",
         "payment_method": "お支払い方法",
+        "bank_transfer_keywords": [],
+    },
+    "カシカシ": {
+        # 予約一覧CSV（kashikashi_booking_list_*.csv）
+        "signature":      ["利用料", "オーナー収益", "利用日時"],
+        "date":           None,
+        "usage_date":     "利用日時",                  # 「2026年9月22日(火) 14:00 〜 15:00」
+        "store":          "スペース名",
+        "amount":         "利用料",
+        "refund":         None,
+        "discount":       None,
+        "booking_id":     "予約ID",
+        "customer":       "利用者名",
+        "net_amount":     "オーナー収益",
+        "payment_method": None,
+        "status":         "ステータス",
+        "cancel_fee":     "キャンセル料",              # キャンセル行はキャンセル料を売上とする
         "bank_transfer_keywords": [],
     },
 }
@@ -318,13 +335,12 @@ init_session()
 
 # ─── ヘルパー ────────────────────────────────────────────────────────────────
 def parse_amount(series: pd.Series) -> pd.Series:
-    """¥記号・カンマを除去して数値に変換（半角・全角どちらも対応）"""
+    """¥記号・カンマ・「円」などを除去して数値に変換（半角・全角どちらも対応）"""
     return pd.to_numeric(
         series.astype(str)
-              .str.replace("¥", "", regex=False)   # 半角 ¥
-              .str.replace("￥", "", regex=False)   # 全角 ￥
-              .str.replace(",", "", regex=False)
-              .str.strip(),
+              .apply(lambda v: unicodedata.normalize("NFKC", v))
+              .str.replace(r"[^\d.\-]", "", regex=True)   # ¥ , 円 空白 などを除去
+              .replace({"": None, "-": None, ".": None}),
         errors="coerce",
     )
 
@@ -526,17 +542,23 @@ def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
     if schema is None:
         raise ValueError(f"{platform} のCSV形式が未登録です")
 
+    # 末尾の「合計」「小計」行は売上ではないので除外
+    is_total = df_raw.astype(str).apply(
+        lambda col: col.str.strip().isin(["合計", "総計", "小計"])).any(axis=1)
+    df_raw = df_raw[~is_total].reset_index(drop=True)
+
     # ── 日付処理 ──
     usage_col   = _col(df_raw, schema.get("usage_date"))
     payment_col = _col(df_raw, schema.get("date")) or usage_col
 
-    payment_dates = pd.to_datetime(df_raw[payment_col], errors="coerce") if payment_col \
+    # 「2026年9月22日(火) 14:00 〜 15:00」のような日本語表記も読めるようにする
+    payment_dates = parse_manual_dates(df_raw[payment_col]) if payment_col \
         else pd.Series(pd.NaT, index=df_raw.index)
     # 「MM/DD (曜) HH:MM〜」のように年が無い利用日は支払日から年を補う
     if usage_col and (platform == "よやクル" or schema.get("usage_date_mmdd")):
         usage_dates = parse_yoyakuru_usage_date(df_raw[usage_col], payment_dates)
     elif usage_col:
-        usage_dates = pd.to_datetime(df_raw[usage_col], errors="coerce")
+        usage_dates = parse_manual_dates(df_raw[usage_col])
     else:
         usage_dates = payment_dates
     usage_dates = pd.to_datetime(usage_dates, errors="coerce")
@@ -546,6 +568,16 @@ def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
     返金 = parse_amount(df_raw[schema["refund"]]).fillna(0).abs() if _col(df_raw, schema.get("refund")) else pd.Series(0, index=df_raw.index)
     割引 = parse_amount(df_raw[schema["discount"]]).fillna(0).abs() if _col(df_raw, schema.get("discount")) else pd.Series(0, index=df_raw.index)
     実売上 = 売上 - 返金 - 割引
+
+    # キャンセル行はキャンセル料だけを売上とする（キャンセル料0なら取込まない）
+    status_col = _col(df_raw, schema.get("status"))
+    cancel_col = _col(df_raw, schema.get("cancel_fee"))
+    if status_col and cancel_col:
+        cancelled = df_raw[status_col].astype(str).str.contains("キャンセル", na=False)
+        cfee = parse_amount(df_raw[cancel_col]).fillna(0)
+        売上   = 売上.where(~cancelled, cfee)
+        実売上 = 実売上.where(~cancelled, cfee)
+        売上   = 売上.where(~(cancelled & (cfee == 0)))   # → NaN で後段の dropna で除外
 
     # ── 決済方法 ──
     決済方法 = (
@@ -575,7 +607,9 @@ def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
 
     # ── 予約ID（列が無い媒体は内容から重複判定用のIDを生成）──
     if _col(df_raw, schema.get("booking_id")):
-        予約ID = df_raw[schema["booking_id"]].astype(str)
+        # 合計行などの空欄があると数値列が float になり「123.0」になるので整数表記に戻す
+        予約ID = df_raw[schema["booking_id"]].apply(
+            lambda v: str(int(v)) if isinstance(v, float) and pd.notna(v) and v.is_integer() else str(v))
     else:
         予約ID = pd.Series(
             [f"{platform}-{d:%Y%m%d}-{s}-{c}-{a:.0f}" if pd.notna(d) and pd.notna(a)
@@ -611,6 +645,18 @@ def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
     dp = dp.dropna(subset=["売上"])
 
     existing = st.session_state.master_data
+    if not existing.empty and "月" in existing.columns:
+        # 以前の取込で日付が読めず「月」が空のまま登録された行は、今回の行で置き換える。
+        # 併せて、過去に誤って取り込まれた「合計」行（予約IDなし・月なし）も掃除する。
+        no_month = existing["月"].isna() | existing["月"].astype(str).isin(["", "NaT", "None", "nan"])
+        same_plat = existing["プラットフォーム"] == platform
+        ids = set(dp["予約ID"].astype(str))
+        stale = same_plat & no_month & (
+            existing["予約ID"].astype(str).isin(ids)
+            | existing["予約ID"].astype(str).isin(["", "nan", "None"]))
+        existing = existing[~stale].reset_index(drop=True)
+        st.session_state.master_data = existing
+
     if existing.empty:
         merged = dp
     else:
@@ -753,12 +799,12 @@ NONE_LABEL = "（なし）"
 
 # 列名の自動推測用キーワード（前方から優先）
 COLUMN_HINTS = {
-    "usage_date":     ["利用日", "利用開始", "実施日", "ご利用日", "予約日", "開始日"],
+    "usage_date":     ["利用日時", "利用日", "利用開始", "実施日", "ご利用日", "予約日", "開始日"],
     "date":           ["決済日", "支払日", "お支払日", "入金日", "振込", "売上日", "成約日"],
     "store":          ["スペース名", "施設名", "店舗名", "店舗", "物件", "会場",
                        "ルーム", "部屋", "スペース", "施設"],
-    "amount":         ["料金", "利用金額", "予約金額", "成約金額", "売上金額", "合計金額", "決済元金", "金額"],
-    "net_amount":     ["振込予定", "振込金額", "手取り", "受取", "支払金額", "入金額"],
+    "amount":         ["利用料", "料金", "利用金額", "予約金額", "成約金額", "売上金額", "合計金額", "決済元金", "金額"],
+    "net_amount":     ["オーナー収益", "振込予定", "振込金額", "手取り", "受取", "支払金額", "入金額"],
     "refund":         ["返金", "キャンセル料"],
     "discount":       ["割引", "クーポン", "値引"],
     "booking_id":     ["予約ID", "予約番号", "決済ID", "受付番号", "注文番号", "ID"],
