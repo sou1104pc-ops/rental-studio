@@ -9,6 +9,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 import io
+from datetime import date, timedelta
+import occupancy as occ
 
 # ─── ストレージ設定（Supabase優先、なければローカルJSON）─────────────────────
 DATA_DIR     = os.path.join(os.path.dirname(__file__), "data")
@@ -112,6 +114,7 @@ def save_state():
         "business_costs": st.session_state.business_costs,
         "store_mapping":  st.session_state.store_mapping,
         "csv_formats":    st.session_state.get("csv_formats", {}),
+        "calendar":       st.session_state.get("calendar", {}),
     }
     if _use_supabase():
         try:
@@ -163,6 +166,7 @@ def load_state():
     st.session_state.business_costs = cfg.get("business_costs", {})
     st.session_state.store_mapping  = cfg.get("store_mapping",  {})
     st.session_state.csv_formats    = cfg.get("csv_formats",    {})   # 手動登録したCSV列マッピング
+    st.session_state.calendar       = cfg.get("calendar",       {})   # Googleカレンダー連携（稼働率）
     st.session_state.state_loaded  = True
 
 st.set_page_config(
@@ -321,6 +325,7 @@ def init_session():
         "invoice_data":   pd.DataFrame(),
         "store_mapping":  {},
         "csv_formats":    {},
+        "calendar":       {},
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -922,7 +927,7 @@ with st.sidebar:
     page = st.radio(
         "ナビゲーション",
         ["📊 ダッシュボード", "🏪 媒体別売上", "📥 データ取込", "📄 請求書管理",
-         "🚫 未入金確定", "⚙️ 設定", "📈 損益レポート", "👥 顧客分析", "🔍 予約検索"],
+         "🚫 未入金確定", "⚙️ 設定", "📈 損益レポート", "📆 稼働率", "👥 顧客分析", "🔍 予約検索"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -1992,9 +1997,9 @@ elif page == "🚫 未入金確定":
 elif page == "⚙️ 設定":
     st.title("⚙️ 設定")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         ["🏢 店舗管理", "💳 手数料設定", "💰 固定費設定", "🌐 事業全体経費",
-         "🔗 店舗名マッピング", "📑 CSV形式"])
+         "🔗 店舗名マッピング", "📑 CSV形式", "📆 カレンダー連携"])
 
     with tab1:
         st.subheader("店舗名の管理")
@@ -2189,6 +2194,69 @@ elif page == "⚙️ 設定":
                         st.success(f"「{plat}」の形式を削除しました（取込済みの売上データは残ります）")
                         st.rerun()
 
+    with tab7:
+        st.subheader("Googleカレンダー連携（稼働率）")
+        st.caption("各店舗のGoogleカレンダーの「iCal形式の非公開URL」を登録すると、「📆 稼働率」ページで"
+                   "予約時間から稼働率を計算します。URLはGoogleカレンダー → 対象カレンダーの「設定と共有」→"
+                   "「カレンダーの統合」→「iCal 形式の非公開URL」からコピーできます。")
+        st.warning("非公開URLを知っている人は誰でも予定を閲覧できます。取り扱いに注意してください。"
+                   "（Streamlitの secrets に `[calendar_urls]` として `店舗名 = \"URL\"` で登録することもできます）")
+
+        cal_cfg = st.session_state.calendar
+        store_cfgs = cal_cfg.get("stores", {})
+        new_store_cfgs = {}
+        for store in st.session_state.stores:
+            sc = store_cfgs.get(store, {})
+            with st.expander(f"🏪 {store}", expanded=bool(sc.get("urls"))):
+                urls = st.text_area("iCal URL（複数ある場合は1行に1つ）", value=sc.get("urls", ""),
+                                    key=f"cal_urls_{store}", height=80)
+                c1, c2, c3 = st.columns(3)
+                open_t  = c1.text_input("営業開始", value=sc.get("open", "09:00"), key=f"cal_open_{store}",
+                                        help="HH:MM 形式")
+                close_t = c2.text_input("営業終了", value=sc.get("close", "22:00"), key=f"cal_close_{store}",
+                                        help="HH:MM 形式。24時間営業は 00:00〜00:00、日またぎは 10:00〜02:00 のように入力")
+                closed = c3.multiselect("定休日", occ.WEEKDAYS_JA,
+                                        default=[occ.WEEKDAYS_JA[i] for i in sc.get("closed_weekdays", [])],
+                                        key=f"cal_closed_{store}")
+                title_filter = st.text_input(
+                    "予定タイトルの絞り込み（任意）", value=sc.get("title_filter", ""),
+                    key=f"cal_filter_{store}",
+                    help="複数店舗で同じカレンダーを使っている場合、タイトルにこの文字を含む予定だけを対象にします")
+                new_store_cfgs[store] = {
+                    "urls": urls.strip(), "open": open_t.strip(), "close": close_t.strip(),
+                    "closed_weekdays": [occ.WEEKDAYS_JA.index(d) for d in closed],
+                    "title_filter": title_filter.strip(),
+                }
+
+        st.divider()
+        st.markdown("**除外する予定（清掃・ブロック等）**")
+        kw_text = st.text_area(
+            "タイトルにこの言葉を含む予定は「予約」として数えません（1行に1つ）",
+            value="\n".join(cal_cfg.get("exclude_keywords", occ.DEFAULT_EXCLUDE_KEYWORDS)),
+            height=180, key="cal_exclude_kw")
+
+        if st.button("カレンダー設定を保存", key="save_calendar"):
+            errors = []
+            for store, sc in new_store_cfgs.items():
+                for label, v in [("営業開始", sc["open"]), ("営業終了", sc["close"])]:
+                    try:
+                        mins = occ.parse_hhmm(v)
+                        if not 0 <= mins <= 24 * 60:
+                            raise ValueError
+                    except Exception:
+                        errors.append(f"{store} の{label}「{v}」が HH:MM 形式ではありません")
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                st.session_state.calendar = {
+                    "stores": new_store_cfgs,
+                    "exclude_keywords": [k.strip() for k in kw_text.splitlines() if k.strip()],
+                }
+                save_state()
+                st.cache_data.clear()
+                st.success("✅ カレンダー設定を保存しました")
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # 📈 損益レポート
@@ -2330,6 +2398,183 @@ elif page == "📈 損益レポート":
             file_name=f"studio_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 📆 稼働率（Googleカレンダー連携）
+# ════════════════════════════════════════════════════════════════════════════
+elif page == "📆 稼働率":
+    st.title("📆 稼働率")
+    st.caption("Googleカレンダーの予定から、清掃・ブロック等を除いた純粋な予約時間で稼働率を計算します。")
+
+    @st.cache_data(ttl=600, show_spinner=False)
+    def _fetch_ics_cached(url: str) -> bytes:
+        return occ.fetch_ics(url)
+
+    cal_cfg = st.session_state.calendar
+    exclude_kw = cal_cfg.get("exclude_keywords", occ.DEFAULT_EXCLUDE_KEYWORDS)
+    try:
+        secret_urls = dict(st.secrets.get("calendar_urls", {}))
+    except Exception:
+        secret_urls = {}
+
+    store_cfgs = {}
+    for store in st.session_state.stores:
+        sc = dict(cal_cfg.get("stores", {}).get(store, {}))
+        urls = [u.strip() for u in sc.get("urls", "").splitlines() if u.strip()]
+        if secret_urls.get(store):
+            urls.append(str(secret_urls[store]).strip())
+        if urls:
+            sc["url_list"] = list(dict.fromkeys(urls))
+            store_cfgs[store] = sc
+
+    if not store_cfgs:
+        st.info("カレンダーが登録されていません。「⚙️ 設定」→「📆 カレンダー連携」で"
+                "各店舗のGoogleカレンダー（iCal形式の非公開URL）を登録してください。")
+        st.stop()
+
+    # ── 期間 ──
+    today = date.today()
+    month_start = today.replace(day=1)
+    prev_end = month_start - timedelta(days=1)
+    c_p, c_r = st.columns([5, 1])
+    with c_p:
+        preset = st.radio("期間", ["今月", "先月", "直近30日", "直近90日", "今年", "カスタム"],
+                          horizontal=True, key="occ_period", label_visibility="collapsed")
+    with c_r:
+        if st.button("🔄 再取得", help="カレンダーを今すぐ読み込み直します（通常は10分間キャッシュ）"):
+            _fetch_ics_cached.clear()
+    if preset == "今月":
+        p_start, p_end = month_start, today
+    elif preset == "先月":
+        p_start, p_end = prev_end.replace(day=1), prev_end
+    elif preset == "直近30日":
+        p_start, p_end = today - timedelta(days=29), today
+    elif preset == "直近90日":
+        p_start, p_end = today - timedelta(days=89), today
+    elif preset == "今年":
+        p_start, p_end = date(today.year, 1, 1), today
+    else:
+        rng = st.date_input("対象期間", value=(month_start, today), key="occ_custom")
+        if not isinstance(rng, (list, tuple)) or len(rng) != 2:
+            st.info("開始日と終了日を選んでください。")
+            st.stop()
+        p_start, p_end = rng
+    st.caption(f"対象期間: **{p_start} 〜 {p_end}**（{(p_end - p_start).days + 1} 日間）")
+
+    # ── 店舗ごとに取得・集計 ──
+    daily_frames, hourly_frames, detail_frames = [], [], []
+    with st.spinner("カレンダーを読み込み中..."):
+        for store, sc in store_cfgs.items():
+            events = []
+            try:
+                for url in sc["url_list"]:
+                    events += occ.parse_events(_fetch_ics_cached(url), p_start, p_end)
+            except Exception as e:
+                st.error(f"{store}: カレンダーを読み込めませんでした（{type(e).__name__}: {e}）。"
+                         "URLが「iCal形式の非公開URL」になっているか確認してください。")
+                continue
+            daily, hourly, detail = occ.compute_occupancy(
+                events, p_start, p_end, sc.get("open", "09:00"), sc.get("close", "22:00"),
+                exclude_kw, sc.get("closed_weekdays", []), sc.get("title_filter", ""))
+            for f in (daily, hourly, detail):
+                f.insert(0, "店舗", store)
+            daily_frames.append(daily)
+            hourly_frames.append(hourly)
+            detail_frames.append(detail)
+
+    if not daily_frames:
+        st.stop()
+    daily_all  = pd.concat(daily_frames,  ignore_index=True)
+    hourly_all = pd.concat(hourly_frames, ignore_index=True)
+    detail_all = pd.concat(detail_frames, ignore_index=True)
+
+    # ── サマリー ──
+    sum_cols = ["営業(分)", "予約(分)", "除外(分)", "予約件数"]
+    tot = daily_all[sum_cols].sum()
+    r1, r2 = occ.rates(tot["予約(分)"], tot["営業(分)"], tot["除外(分)"])
+    st.divider()
+    st.subheader("📌 全店舗の稼働率")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("実質稼働率", f"{r2:.1f}%" if r2 is not None else "-",
+              help="予約時間 ÷（営業時間 − 清掃・ブロック等の時間）")
+    k2.metric("稼働率（営業時間ベース）", f"{r1:.1f}%" if r1 is not None else "-",
+              help="予約時間 ÷ 営業時間")
+    k3.metric("予約時間", f"{tot['予約(分)'] / 60:,.1f} h")
+    k4.metric("清掃等（除外）", f"{tot['除外(分)'] / 60:,.1f} h")
+    k5.metric("予約件数", f"{int(tot['予約件数']):,} 件")
+    st.caption("※ 同じ時間帯の予約が重複していても1回分として数えます。終日の予定は集計対象外です。")
+
+    by_store = occ.add_rate_cols(daily_all.groupby("店舗", as_index=False)[sum_cols].sum())
+    # 売上データ（確認済み）があれば、予約1時間あたりの売上も出す
+    sales_df = get_confirmed_data()
+    if sales_df is not None and "利用日" in sales_df.columns:
+        ud = pd.to_datetime(sales_df["利用日"], errors="coerce")
+        in_p = sales_df[(ud >= pd.Timestamp(p_start)) & (ud < pd.Timestamp(p_end) + pd.Timedelta(days=1))]
+        sales_by_store = in_p.groupby("店舗")["売上"].sum()
+        by_store["売上"] = by_store["店舗"].map(sales_by_store).fillna(0)
+        by_store["予約1hあたり売上"] = (by_store["売上"] / by_store["予約(h)"].where(by_store["予約(h)"] > 0)).round(0)
+    show = ["店舗", "実質稼働率(%)", "稼働率(%)", "予約(h)", "除外(h)", "営業(h)", "予約件数"] + \
+           [c for c in ["売上", "予約1hあたり売上"] if c in by_store.columns]
+    fmt = {"実質稼働率(%)": "{:.1f}%", "稼働率(%)": "{:.1f}%", "予約(h)": "{:,.1f}",
+           "除外(h)": "{:,.1f}", "営業(h)": "{:,.1f}"}
+    for c in ["売上", "予約1hあたり売上"]:
+        if c in by_store.columns:
+            fmt[c] = lambda v: fmt_yen(v) if pd.notna(v) else "-"
+    st.dataframe(by_store[show].style.format(fmt, na_rep="-"), hide_index=True, use_container_width=True)
+
+    # ── グラフ ──
+    basis = st.radio("グラフの基準", ["実質稼働率(%)", "稼働率(%)"], horizontal=True, key="occ_basis",
+                     help="実質稼働率 = 清掃・ブロック等の時間を貸出可能時間から除いたもの")
+    store_opts = ["全店舗"] + list(store_cfgs.keys())
+    sel = st.selectbox("店舗", store_opts, key="occ_store")
+    d_sel = daily_all if sel == "全店舗" else daily_all[daily_all["店舗"] == sel]
+    h_sel = hourly_all if sel == "全店舗" else hourly_all[hourly_all["店舗"] == sel]
+    det_sel = detail_all if sel == "全店舗" else detail_all[detail_all["店舗"] == sel]
+
+    t_trend, t_wd, t_heat, t_list = st.tabs(["📈 推移", "📅 曜日別", "🕒 時間帯×曜日", "📋 予定一覧"])
+
+    with t_trend:
+        d_tr = d_sel.copy()
+        d_tr["日付"] = pd.to_datetime(d_tr["日付"])
+        long_range = (p_end - p_start).days > 62
+        d_tr["期間"] = d_tr["日付"].dt.to_period("M").dt.to_timestamp() if long_range else d_tr["日付"]
+        trend = occ.add_rate_cols(d_tr.groupby(["期間", "店舗"], as_index=False)[sum_cols].sum())
+        fig = px.line(trend, x="期間", y=basis, color="店舗", markers=True,
+                      title=f"{'月別' if long_range else '日別'} {basis.replace('(%)', '')}")
+        fig.update_yaxes(ticksuffix="%", rangemode="tozero")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with t_wd:
+        d_wd = d_sel.copy()
+        d_wd["曜日"] = pd.to_datetime(d_wd["日付"]).dt.weekday.map(lambda i: occ.WEEKDAYS_JA[i])
+        wd = occ.add_rate_cols(d_wd.groupby(["曜日", "店舗"], as_index=False)[sum_cols].sum())
+        fig = px.bar(wd, x="曜日", y=basis, color="店舗", barmode="group",
+                     category_orders={"曜日": occ.WEEKDAYS_JA}, title=f"曜日別 {basis.replace('(%)', '')}")
+        fig.update_yaxes(ticksuffix="%", rangemode="tozero")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with t_heat:
+        if h_sel.empty:
+            st.info("営業時間帯のデータがありません。")
+        else:
+            hm = occ.add_rate_cols(h_sel.groupby(["曜日", "時"], as_index=False)[["営業(分)", "予約(分)", "除外(分)"]].sum())
+            piv = hm.pivot(index="曜日", columns="時", values=basis).reindex(
+                [d for d in occ.WEEKDAYS_JA if d in hm["曜日"].unique()])
+            fig = px.imshow(piv, color_continuous_scale="Blues", zmin=0, zmax=100, aspect="auto",
+                            labels={"x": "時", "y": "曜日", "color": "%"},
+                            title=f"時間帯×曜日 {basis.replace('(%)', '')}（{sel}）", text_auto=".0f")
+            st.plotly_chart(fig, use_container_width=True)
+
+    with t_list:
+        st.caption("分類が正しいか確認できます。清掃などが「予約」になっている場合は、"
+                   "「⚙️ 設定」→「📆 カレンダー連携」の除外キーワードに追加してください。")
+        kinds = st.multiselect("分類", ["予約", "除外", "終日（対象外）"],
+                               default=["予約", "除外", "終日（対象外）"], key="occ_kinds")
+        lst = det_sel[det_sel["分類"].isin(kinds)].sort_values("開始")
+        st.caption(f"{len(lst):,} 件")
+        st.dataframe(lst[["店舗", "開始", "終了", "タイトル", "分類", "時間(h)"]],
+                     hide_index=True, use_container_width=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
