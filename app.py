@@ -1582,6 +1582,25 @@ elif page == "📥 データ取込":
 # 📄 請求書管理
 # ════════════════════════════════════════════════════════════════════════════
 elif page == "📄 請求書管理":
+    def _customer_key(name) -> str:
+        """「井上様」「井上 さん」「School ACTY」「schoolACTY」などを同じ顧客として扱うキー。"""
+        return re.sub(r"(様|さま|さん|殿)$", "", _clean_key(name or ""))
+
+    def usual_invoice_store(inv_df: pd.DataFrame, customer, exclude_idx=None) -> Optional[str]:
+        """その顧客の過去の請求書で一番多い店舗（2件以上かつ6割以上を占める場合のみ）。"""
+        if inv_df is None or inv_df.empty or "顧客名" not in inv_df.columns:
+            return None
+        key = _customer_key(customer)
+        if not key:
+            return None
+        past = inv_df[inv_df["顧客名"].apply(_customer_key) == key]
+        if exclude_idx is not None:
+            past = past.drop(index=exclude_idx, errors="ignore")
+        counts = past["店舗"].value_counts()
+        if counts.empty or counts.iloc[0] < 2 or counts.iloc[0] / counts.sum() < 0.6:
+            return None
+        return counts.index[0]
+
     st.title("📄 請求書管理（定期利用・銀行振込）")
     st.caption("定期利用者への請求書を店舗ごとに登録します。手数料なし・入金確認後に売上反映。")
 
@@ -1592,7 +1611,8 @@ elif page == "📄 請求書管理":
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            inv_store   = st.selectbox("店舗", st.session_state.stores, key="inv_store")
+            inv_store   = st.selectbox("店舗", st.session_state.stores, index=None,
+                                       placeholder="店舗を選択", key="inv_store")
         with c2:
             _cur_month  = datetime.now().strftime("%Y-%m")
             inv_month   = st.selectbox(
@@ -1609,6 +1629,12 @@ elif page == "📄 請求書管理":
         with c5:
             inv_amount   = st.number_input("請求金額（円）", min_value=0, step=100, key="inv_amount")
 
+        _usual = usual_invoice_store(st.session_state.invoice_data, inv_customer)
+        if _usual and inv_store and inv_store != _usual:
+            st.warning(f"⚠️ 「{inv_customer}」はこれまで **{_usual}** で登録されています。店舗が合っているか確認してください。")
+        elif _usual and not inv_store:
+            st.info(f"💡 「{inv_customer}」はこれまで **{_usual}** で登録されています。")
+
         c6, c7 = st.columns(2)
         with c6:
             inv_date     = st.date_input("請求日", key="inv_date")
@@ -1616,8 +1642,8 @@ elif page == "📄 請求書管理":
             inv_note     = st.text_input("備考（任意）", key="inv_note")
 
         if st.button("📄 請求書を登録", key="add_invoice"):
-            if not inv_number or not inv_customer or inv_amount <= 0:
-                st.error("請求書番号・顧客名・金額は必須です")
+            if not inv_store or not inv_number or not inv_customer or inv_amount <= 0:
+                st.error("店舗・請求書番号・顧客名・金額は必須です")
             else:
                 new_row = pd.DataFrame([{
                     "請求書番号":     inv_number,
@@ -1667,6 +1693,32 @@ elif page == "📄 請求書管理":
         if inv.empty:
             st.info("請求書データがありません。「請求書登録」タブから追加してください。")
         else:
+            # ── 店舗がいつもと違う請求書（登録時の選び間違いの検出）──
+            mismatch = []
+            for idx, row in inv.iterrows():
+                usual = usual_invoice_store(inv, row.get("顧客名"), exclude_idx=idx)
+                if usual and row.get("店舗") != usual:
+                    mismatch.append((idx, row, usual))
+            if mismatch:
+                st.warning(f"⚠️ 店舗がいつもと違う請求書が {len(mismatch)} 件あります。"
+                           "登録時に店舗を選び間違えていないか確認してください。")
+                with st.expander("確認・修正する", expanded=True):
+                    if st.button(f"🔧 {len(mismatch)} 件すべて、いつもの店舗に直す", key="inv_fix_all"):
+                        for idx, _, usual in mismatch:
+                            st.session_state.invoice_data.at[idx, "店舗"] = usual
+                        save_state()
+                        _rebuild_cache()
+                        st.rerun()
+                    for idx, row, usual in mismatch:
+                        mc1, mc2 = st.columns([4, 2])
+                        mc1.write(f"**{row['請求書番号']}**　{row['顧客名']}　月: {row['月']}　{fmt_yen(row['実売上'])}"
+                                  f"　店舗: {row['店舗']} → いつもは **{usual}**")
+                        if mc2.button(f"{usual} に直す", key=f"inv_fix_{idx}"):
+                            st.session_state.invoice_data.at[idx, "店舗"] = usual
+                            save_state()
+                            _rebuild_cache()
+                            st.rerun()
+
             # ── 未入金一覧（未入金確定にしたものは「🚫 未入金確定」ページで管理）──
             pending_inv = inv[(inv["確認済み"] == False) & (~is_bad_debt(inv))]
             bad_inv     = inv[is_bad_debt(inv)]
