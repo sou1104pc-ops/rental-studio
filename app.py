@@ -9,15 +9,43 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 import io
+import uuid
 from datetime import date, timedelta
 import occupancy as occ
 
 # ─── ストレージ設定（Supabase優先、なければローカルJSON）─────────────────────
 DATA_DIR     = os.path.join(os.path.dirname(__file__), "data")
-MASTER_PATH  = os.path.join(DATA_DIR, "master_data.json")
-INVOICE_PATH = os.path.join(DATA_DIR, "invoice_data.json")
-CONFIG_PATH  = os.path.join(DATA_DIR, "config.json")
 os.makedirs(DATA_DIR, exist_ok=True)
+REGISTRY_PATH = os.path.join(DATA_DIR, "tenants.json")
+
+# ─── 会社（テナント）ごとのデータ分離 ─────────────────────────────────────────
+# ログイン機能（st.login）を設定すると、会社ごとにデータを分けて複数の会社で使える。
+# ログイン導入前からのデータは LEGACY_TENANT としてそのままのキー・ファイルで扱う。
+LEGACY_TENANT = "default"
+LEGACY_DEFAULT_STORES = ["元町駅前店", "加古川駅前店", "加古川今福店"]
+
+
+def _tenant() -> str:
+    return st.session_state.get("_tenant_id") or LEGACY_TENANT
+
+
+def _is_legacy() -> bool:
+    return _tenant() == LEGACY_TENANT
+
+
+def _k(name: str) -> str:
+    """Supabase app_storage のキー。会社ごとに接頭辞を付ける。"""
+    return name if _is_legacy() else f"t:{_tenant()}:{name}"
+
+
+def _data_path(name: str) -> str:
+    d = DATA_DIR if _is_legacy() else os.path.join(DATA_DIR, "tenants", _tenant())
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, name)
+
+
+def default_stores() -> list:
+    return list(LEGACY_DEFAULT_STORES) if _is_legacy() else []
 
 DATETIME_COLS = ["利用日", "支払日", "未入金確定日"]
 
@@ -98,11 +126,11 @@ def _json_to_df(path: str) -> pd.DataFrame:
 
 # ─── 保存・読込（Supabase / ローカル自動切替）────────────────────────────────
 def _save_local(config: dict):
-    with open(MASTER_PATH,  "w", encoding="utf-8") as f:
+    with open(_data_path("master_data.json"),  "w", encoding="utf-8") as f:
         f.write(_df_to_json(st.session_state.master_data))
-    with open(INVOICE_PATH, "w", encoding="utf-8") as f:
+    with open(_data_path("invoice_data.json"), "w", encoding="utf-8") as f:
         f.write(_df_to_json(st.session_state.invoice_data))
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    with open(_data_path("config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 
@@ -117,7 +145,7 @@ _CACHE_KEYS = ["_all_data", "_confirmed_data", "_total_records", "_pending_count
 
 
 def _remote_rev(sb) -> int:
-    rows = sb.table("app_storage").select("value").eq("key", "rev").execute().data
+    rows = sb.table("app_storage").select("value").eq("key", _k("rev")).execute().data
     return int((rows[0].get("value") or {}).get("n", 0)) if rows else 0
 
 
@@ -128,12 +156,12 @@ def _claim_rev(sb) -> bool:
         return False
     new = old + 1
     if old == 0:
-        if sb.table("app_storage").select("key").eq("key", "rev").execute().data:
+        if sb.table("app_storage").select("key").eq("key", _k("rev")).execute().data:
             return False
-        sb.table("app_storage").insert({"key": "rev", "value": {"n": new}}).execute()
+        sb.table("app_storage").insert({"key": _k("rev"), "value": {"n": new}}).execute()
     else:
         res = (sb.table("app_storage").update({"value": {"n": new}})
-               .eq("key", "rev").eq("value->>n", str(old)).execute())
+               .eq("key", _k("rev")).eq("value->>n", str(old)).execute())
         if not res.data:
             return False
     st.session_state._loaded_rev = new
@@ -193,9 +221,9 @@ def save_state():
         if not claimed:
             _abort_conflicting_save(conflict)
         try:
-            sb.table("app_storage").upsert({"key": "master_data",  "value": _df_to_records(st.session_state.master_data)}).execute()
-            sb.table("app_storage").upsert({"key": "invoice_data", "value": _df_to_records(st.session_state.invoice_data)}).execute()
-            sb.table("app_storage").upsert({"key": "config",       "value": config}).execute()
+            sb.table("app_storage").upsert({"key": _k("master_data"),  "value": _df_to_records(st.session_state.master_data)}).execute()
+            sb.table("app_storage").upsert({"key": _k("invoice_data"), "value": _df_to_records(st.session_state.invoice_data)}).execute()
+            sb.table("app_storage").upsert({"key": _k("config"),       "value": config}).execute()
         except Exception as e:
             _save_local(config)
             st.error(f"保存に失敗しました（{type(e).__name__}: {e}）。最新のデータを確認してください。")
@@ -204,11 +232,11 @@ def save_state():
 
 
 def _load_local() -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
-    master  = _json_to_df(MASTER_PATH)
-    invoice = _json_to_df(INVOICE_PATH)
+    master  = _json_to_df(_data_path("master_data.json"))
+    invoice = _json_to_df(_data_path("invoice_data.json"))
     cfg = {}
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+    if os.path.exists(_data_path("config.json")):
+        with open(_data_path("config.json"), encoding="utf-8") as f:
             cfg = json.load(f)
     return master, invoice, cfg
 
@@ -219,7 +247,10 @@ def load_state():
     if _use_supabase():
         try:
             sb = _get_supabase()
-            rows = {r["key"]: r["value"] for r in sb.table("app_storage").select("key, value").execute().data}
+            names = ["master_data", "invoice_data", "config", "rev"]
+            raw = sb.table("app_storage").select("key, value").in_("key", [_k(n) for n in names]).execute().data
+            by_key = {r["key"]: r["value"] for r in raw}
+            rows = {n: by_key.get(_k(n)) for n in names}   # 自分の会社のデータだけを読む
             master  = _records_to_df(rows.get("master_data") or [])
             invoice = _records_to_df(rows.get("invoice_data") or [])
             cfg = rows.get("config") or {}
@@ -234,7 +265,7 @@ def load_state():
     else:
         st.session_state.master_data, st.session_state.invoice_data, cfg = _load_local()
         st.session_state._storage_mode = "ローカル (Supabase未設定)"
-    st.session_state.stores         = cfg.get("stores",         ["元町駅前店", "加古川駅前店", "加古川今福店"])
+    st.session_state.stores         = cfg.get("stores",         default_stores())
     # 既存の保存値を優先しつつ、新しく追加した媒体はデフォルト率で補完する
     st.session_state.platform_fees  = {**DEFAULT_PLATFORM_FEES, **cfg.get("platform_fees", {})}
     st.session_state.fixed_costs    = cfg.get("fixed_costs",    {})
@@ -392,7 +423,7 @@ def init_session():
     load_state()
     # ファイルがなかった項目だけデフォルト値をセット
     defaults = {
-        "stores":         ["元町駅前店", "加古川駅前店", "加古川今福店"],
+        "stores":         default_stores(),
         "platform_fees":  dict(DEFAULT_PLATFORM_FEES),
         "fixed_costs":    {},
         "business_costs": {},   # 事業全体の経費（店舗に紐づかない）
@@ -408,6 +439,152 @@ def init_session():
     # 既存データにも入金管理用の列を必ず用意しておく（過去データはそのまま保持）
     st.session_state.master_data  = ensure_deposit_cols(st.session_state.master_data)
     st.session_state.invoice_data = ensure_deposit_cols(st.session_state.invoice_data)
+
+
+# ─── ログイン・会社の振り分け ───────────────────────────────────────────────
+# secrets に [auth]（Googleログイン設定）があればログイン必須・会社ごとにデータを分ける。
+# なければ従来どおりログインなしで既存データ（LEGACY_TENANT）を使う。
+def auth_enabled() -> bool:
+    try:
+        return bool(st.secrets.get("auth", {}).get("client_id"))
+    except Exception:
+        return False
+
+
+def admin_emails() -> list:
+    try:
+        return [str(e).strip().lower() for e in st.secrets.get("app", {}).get("admins", [])]
+    except Exception:
+        return []
+
+
+def _current_email() -> str:
+    return str(getattr(st.user, "email", "") or "").strip().lower()
+
+
+def is_admin() -> bool:
+    return auth_enabled() and _current_email() in admin_emails()
+
+
+def load_registry() -> dict:
+    """会社一覧 {tenant_id: {"name", "members": [email], "disabled"}}。
+    初回は既存データの会社を管理者が使える状態で作る。"""
+    reg = None
+    if _use_supabase():
+        rows = _get_supabase().table("app_storage").select("value").eq("key", "tenants").execute().data
+        reg = rows[0]["value"] if rows else None
+    elif os.path.exists(REGISTRY_PATH):
+        with open(REGISTRY_PATH, encoding="utf-8") as f:
+            reg = json.load(f)
+    if not reg:
+        reg = {LEGACY_TENANT: {"name": "合同会社ScalePro", "members": admin_emails(), "disabled": False}}
+        save_registry(reg)
+    return reg
+
+
+def save_registry(reg: dict):
+    if _use_supabase():
+        _get_supabase().table("app_storage").upsert({"key": "tenants", "value": reg}).execute()
+    else:
+        with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+            json.dump(reg, f, ensure_ascii=False, indent=2)
+
+
+def _switch_tenant(tenant_id: str, name: str):
+    """会社が変わったら、前の会社のデータを画面から完全に消してから切り替える。"""
+    if st.session_state.get("_tenant_id") != tenant_id:
+        for k in list(st.session_state.keys()):
+            if k != "_tenant_pick":
+                del st.session_state[k]
+        st.session_state._tenant_id = tenant_id
+    st.session_state._tenant_name = name
+
+
+def _parse_emails(text: str) -> list:
+    out = []
+    for e in re.split(r"[\s,、]+", text or ""):
+        e = e.strip().lower()
+        if e and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e) and e not in out:
+            out.append(e)
+    return out
+
+
+def render_admin():
+    """管理者用：会社と利用者（メールアドレス）の登録。"""
+    st.title("🛠 利用者管理")
+    st.caption("会社と、その会社を使える人（Googleアカウントのメールアドレス）を登録します。"
+               "会社ごとにデータは完全に分かれていて、ほかの会社からは見えません。")
+    reg = load_registry()
+
+    st.subheader("➕ 会社を追加")
+    with st.form("admin_add_tenant", clear_on_submit=True):
+        name = st.text_input("会社名")
+        members = st.text_area("使う人のメールアドレス（1行に1人）",
+                               placeholder="taro@example.com\nhanako@example.com")
+        if st.form_submit_button("会社を追加"):
+            emails = _parse_emails(members)
+            if not name.strip() or not emails:
+                st.error("会社名と、正しい形式のメールアドレスを1つ以上入力してください")
+            else:
+                reg[uuid.uuid4().hex[:10]] = {"name": name.strip(), "members": emails, "disabled": False}
+                save_registry(reg)
+                st.success(f"✅ 「{name.strip()}」を追加しました。登録したメールアドレスのGoogleアカウントでログインすると使えます。")
+
+    st.subheader("登録済みの会社")
+    for tid, t in sorted(reg.items(), key=lambda kv: kv[1].get("name", "")):
+        label = f"{'🚫 ' if t.get('disabled') else ''}{t.get('name', '')}（{len(t.get('members', []))} 人）"
+        with st.expander(label):
+            with st.form(f"admin_edit_{tid}"):
+                n = st.text_input("会社名", value=t.get("name", ""))
+                m = st.text_area("使う人のメールアドレス（1行に1人）", value="\n".join(t.get("members", [])))
+                d = st.checkbox("利用停止（ログインしても使えなくする。データは残ります）",
+                                value=bool(t.get("disabled")))
+                if st.form_submit_button("保存"):
+                    emails = _parse_emails(m)
+                    if not n.strip():
+                        st.error("会社名を入力してください")
+                    else:
+                        reg[tid] = {**t, "name": n.strip(), "members": emails, "disabled": d}
+                        save_registry(reg)
+                        st.success("✅ 保存しました")
+                        st.rerun()
+
+
+def resolve_tenant():
+    if not auth_enabled():
+        _switch_tenant(LEGACY_TENANT, "合同会社ScalePro")
+        return
+    if not st.user.is_logged_in:
+        st.title("🏢 貸しスペース 売上管理")
+        st.write("ご利用にはログインが必要です。")
+        if st.button("Googleアカウントでログイン", type="primary"):
+            st.login()
+        st.stop()
+    email = _current_email()
+    reg = load_registry()
+    mine = {tid: t for tid, t in reg.items()
+            if not t.get("disabled") and email in [m.strip().lower() for m in t.get("members", [])]}
+    if not mine:
+        if is_admin():          # 管理者は会社に属していなくても利用者管理だけは使える
+            with st.sidebar:
+                st.caption(f"👤 {email}")
+                if st.button("ログアウト"):
+                    st.logout()
+            render_admin()
+            st.stop()
+        st.title("🏢 貸しスペース 売上管理")
+        st.warning(f"{email} はまだ利用登録されていません。管理者に登録を依頼してください。")
+        if st.button("ログアウト"):
+            st.logout()
+        st.stop()
+    ids = sorted(mine, key=lambda t: mine[t]["name"])
+    tid = ids[0]
+    if len(ids) > 1:
+        tid = st.sidebar.selectbox("会社", ids, format_func=lambda t: mine[t]["name"], key="_tenant_pick")
+    _switch_tenant(tid, mine[tid]["name"])
+
+
+resolve_tenant()
 
 
 refresh_if_stale()
@@ -1003,13 +1180,12 @@ def render_schema_builder(df_raw: pd.DataFrame, key_suffix: str = ""):
 
 # ─── サイドバー ───────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🏢 合同会社ScalePro")
-    page = st.radio(
-        "ナビゲーション",
-        ["📊 ダッシュボード", "🏪 媒体別売上", "📥 データ取込", "📄 請求書管理",
-         "🚫 未入金確定", "⚙️ 設定", "📈 損益レポート", "📆 稼働率", "👥 顧客分析", "🔍 予約検索"],
-        label_visibility="collapsed",
-    )
+    st.title(f"🏢 {st.session_state.get('_tenant_name') or '売上管理'}")
+    nav = ["📊 ダッシュボード", "🏪 媒体別売上", "📥 データ取込", "📄 請求書管理",
+           "🚫 未入金確定", "⚙️ 設定", "📈 損益レポート", "📆 稼働率", "👥 顧客分析", "🔍 予約検索"]
+    if is_admin():
+        nav.append("🛠 利用者管理")
+    page = st.radio("ナビゲーション", nav, label_visibility="collapsed")
     st.divider()
     if "_total_records" not in st.session_state:
         _rebuild_cache()
@@ -1024,6 +1200,10 @@ with st.sidebar:
         st.error(f"未入金確定: {bad_cnt} 件 / {fmt_yen(st.session_state.get('_bad_debt_amount', 0))}")
     if st.session_state.get("_storage_mode"):
         st.caption(f"💾 {st.session_state._storage_mode}")
+    if auth_enabled():
+        st.caption(f"👤 {_current_email()}")
+        if st.button("ログアウト", key="logout_btn"):
+            st.logout()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1035,6 +1215,9 @@ if page == "📊 ダッシュボード":
     df = get_confirmed_data()
 
     if df is None:
+        if not st.session_state.stores:
+            st.info("👋 はじめに「⚙️ 設定」→「🏢 店舗管理」で店舗名を登録してください。"
+                    "そのあと「📥 データ取込」から各予約サイトのCSVを取り込むと、売上が表示されます。")
         st.info("確認済みデータがありません。「データ取込」からCSVをアップロードしてください。")
         st.subheader("📌 完成イメージ（サンプル）")
         import numpy as np
@@ -1042,7 +1225,7 @@ if page == "📊 ダッシュボード":
         months = pd.date_range("2024-01", periods=6, freq="ME")
         sample_rows = []
         for m in months:
-            for store in st.session_state.stores:
+            for store in (st.session_state.stores or ["店舗A", "店舗B"]):
                 for plat in PLATFORMS:
                     sample_rows.append({"月": m.strftime("%Y-%m"), "店舗": store,
                                         "プラットフォーム": plat,
@@ -2545,8 +2728,8 @@ elif page == "📆 稼働率":
 
     cal_cfg = st.session_state.calendar
     exclude_kw = cal_cfg.get("exclude_keywords", occ.DEFAULT_EXCLUDE_KEYWORDS)
-    try:
-        secret_urls = dict(st.secrets.get("calendar_urls", {}))
+    try:   # secrets の URL はログイン導入前からの会社（既存データ）専用
+        secret_urls = dict(st.secrets.get("calendar_urls", {})) if _is_legacy() else {}
     except Exception:
         secret_urls = {}
 
@@ -2884,3 +3067,10 @@ elif page == "🔍 予約検索":
             show_cols = [c for c in ["予約ID", "利用日", "顧客名", "店舗", "プラットフォーム",
                                       "決済方法", "売上", "返金", "実売上"] if c in refunded.columns]
             st.dataframe(refunded[show_cols], use_container_width=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🛠 利用者管理（管理者のみ）
+# ════════════════════════════════════════════════════════════════════════════
+elif page == "🛠 利用者管理" and is_admin():
+    render_admin()
