@@ -2506,22 +2506,44 @@ elif page == "📆 稼働率":
     st.caption("※ 同じ時間帯の予約が重複していても1回分として数えます。終日の予定は集計対象外です。")
 
     by_store = occ.add_rate_cols(daily_all.groupby("店舗", as_index=False)[sum_cols].sum())
-    # 売上データ（確認済み）があれば、予約1時間あたりの売上も出す
-    sales_df = get_confirmed_data()
+    # 売上データがあれば、予約1時間あたりの売上も出す。
+    # 予約時間は入金と関係なく発生するので、入金待ち（請求書払い・振込待ちなど）も含め、
+    # 未入金確定（貸倒）だけを除く。請求書は「利用日」に請求日が入っているため「対象月」で期間に含める。
+    sales_df = get_all_data()
+    inv_by_store = None
     if sales_df is not None and "利用日" in sales_df.columns:
+        sales_df = sales_df[~is_bad_debt(sales_df)]
         ud = pd.to_datetime(sales_df["利用日"], errors="coerce")
-        in_p = sales_df[(ud >= pd.Timestamp(p_start)) & (ud < pd.Timestamp(p_end) + pd.Timedelta(days=1))]
+        in_date = (ud >= pd.Timestamp(p_start)) & (ud < pd.Timestamp(p_end) + pd.Timedelta(days=1))
+        is_inv = (sales_df["データ種別"] == "請求書") if "データ種別" in sales_df.columns \
+            else pd.Series(False, index=sales_df.index)
+        period_months = pd.period_range(p_start, p_end, freq="M").strftime("%Y-%m").tolist()
+        in_month = sales_df["月"].isin(period_months) if "月" in sales_df.columns else in_date
+        in_p = sales_df[(is_inv & in_month) | (~is_inv & in_date)]
         sales_by_store = in_p.groupby("店舗")["売上"].sum()
         by_store["売上"] = by_store["店舗"].map(sales_by_store).fillna(0)
+        inv_p = in_p[is_inv.loc[in_p.index]]
+        if not inv_p.empty:
+            by_store["うち請求書"] = by_store["店舗"].map(inv_p.groupby("店舗")["売上"].sum()).fillna(0)
+            inv_by_store = inv_p
         by_store["予約1hあたり売上"] = (by_store["売上"] / by_store["予約(h)"].where(by_store["予約(h)"] > 0)).round(0)
     show = ["店舗", "実質稼働率(%)", "稼働率(%)", "予約(h)", "除外(h)", "営業(h)", "予約件数"] + \
-           [c for c in ["売上", "予約1hあたり売上"] if c in by_store.columns]
+           [c for c in ["売上", "うち請求書", "予約1hあたり売上"] if c in by_store.columns]
     fmt = {"実質稼働率(%)": "{:.1f}%", "稼働率(%)": "{:.1f}%", "予約(h)": "{:,.1f}",
            "除外(h)": "{:,.1f}", "営業(h)": "{:,.1f}"}
-    for c in ["売上", "予約1hあたり売上"]:
+    for c in ["売上", "うち請求書", "予約1hあたり売上"]:
         if c in by_store.columns:
             fmt[c] = lambda v: fmt_yen(v) if pd.notna(v) else "-"
     st.dataframe(by_store[show].style.format(fmt, na_rep="-"), hide_index=True, use_container_width=True)
+    if "売上" in by_store.columns:
+        st.caption("※ 売上は入金待ちも含みます（未入金確定のみ除外）。請求書払いは請求書の「対象月」が"
+                   "期間に含まれるものを計上しています。")
+    if inv_by_store is not None:
+        with st.expander(f"📄 この期間に計上した請求書（{len(inv_by_store)} 件）"):
+            inv_cols = [c for c in ["店舗", "月", "請求書番号", "顧客名", "売上", "入金ステータス"]
+                        if c in inv_by_store.columns]
+            st.dataframe(inv_by_store[inv_cols].style.format({"売上": fmt_yen}),
+                         hide_index=True, use_container_width=True)
 
     # ── グラフ ──
     basis = st.radio("グラフの基準", ["実質稼働率(%)", "稼働率(%)"], horizontal=True, key="occ_basis",
