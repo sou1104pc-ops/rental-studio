@@ -106,6 +106,68 @@ def _save_local(config: dict):
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 
+# ─── 複数人で同時に使うための保護 ──────────────────────────────────────────────
+# app_storage の "rev" 行に保存回数（版番号）を持たせる。
+# ・画面を操作するたびに版番号を確認し、ほかの人が保存していたら最新データを読み込み直す
+# ・保存時は「読み込んだ版番号のままなら +1 する」を1回の更新で行い（比較して更新）、
+#   その間に別の人が保存していたら上書きせずに中止する
+# これで、古いデータを持った画面が他の人の変更を丸ごと消してしまうことを防ぐ。
+_CACHE_KEYS = ["_all_data", "_confirmed_data", "_total_records", "_pending_count",
+               "_bad_debt_count", "_bad_debt_amount"]
+
+
+def _remote_rev(sb) -> int:
+    rows = sb.table("app_storage").select("value").eq("key", "rev").execute().data
+    return int((rows[0].get("value") or {}).get("n", 0)) if rows else 0
+
+
+def _claim_rev(sb) -> bool:
+    """読み込んだ版のままなら版番号を +1 して True。ほかの人が先に保存していたら False。"""
+    old = st.session_state.get("_loaded_rev")
+    if old is None:            # 読み込みに失敗した画面からは保存させない
+        return False
+    new = old + 1
+    if old == 0:
+        if sb.table("app_storage").select("key").eq("key", "rev").execute().data:
+            return False
+        sb.table("app_storage").insert({"key": "rev", "value": {"n": new}}).execute()
+    else:
+        res = (sb.table("app_storage").update({"value": {"n": new}})
+               .eq("key", "rev").eq("value->>n", str(old)).execute())
+        if not res.data:
+            return False
+    st.session_state._loaded_rev = new
+    return True
+
+
+def _reload_state():
+    """手元のデータを捨てて、保存されている最新データを読み込み直す。"""
+    for k in ["state_loaded"] + _CACHE_KEYS:
+        st.session_state.pop(k, None)
+    init_session()
+
+
+def refresh_if_stale():
+    """ほかの人が保存していたら、この画面のデータを最新にする（毎回の操作の最初に呼ぶ）。"""
+    st.session_state._refreshed_this_run = False
+    if "state_loaded" not in st.session_state or not _use_supabase():
+        return
+    try:
+        rev = _remote_rev(_get_supabase())
+    except Exception:
+        return
+    if rev != st.session_state.get("_loaded_rev"):
+        _reload_state()
+        st.session_state._refreshed_this_run = True
+
+
+def _abort_conflicting_save(reason: str):
+    """保存を中止し、最新データを読み込み直して画面を描き直す。"""
+    st.session_state._save_conflict_msg = reason
+    _reload_state()
+    st.rerun()
+
+
 def save_state():
     config = {
         "stores":         st.session_state.stores,
@@ -116,16 +178,27 @@ def save_state():
         "csv_formats":    st.session_state.get("csv_formats", {}),
         "calendar":       st.session_state.get("calendar", {}),
     }
+    conflict = ("ほかの人が先にデータを更新したため、今の操作は保存しませんでした。"
+                "最新のデータを読み込み直したので、もう一度操作してください。")
     if _use_supabase():
+        if st.session_state.get("_refreshed_this_run"):
+            # この操作の直前に最新データへ入れ替わっている＝古い画面を見て押された操作
+            _abort_conflicting_save(conflict)
         try:
             sb = _get_supabase()
+            claimed = _claim_rev(sb)
+        except Exception as e:
+            st.error(f"保存できませんでした（{type(e).__name__}: {e}）。時間をおいてもう一度試してください。")
+            st.stop()
+        if not claimed:
+            _abort_conflicting_save(conflict)
+        try:
             sb.table("app_storage").upsert({"key": "master_data",  "value": _df_to_records(st.session_state.master_data)}).execute()
             sb.table("app_storage").upsert({"key": "invoice_data", "value": _df_to_records(st.session_state.invoice_data)}).execute()
             sb.table("app_storage").upsert({"key": "config",       "value": config}).execute()
-        except Exception:
+        except Exception as e:
             _save_local(config)
-    else:
-        _save_local(config)
+            st.error(f"保存に失敗しました（{type(e).__name__}: {e}）。最新のデータを確認してください。")
     # 常にローカルにもバックアップ保存
     _save_local(config)
 
@@ -150,11 +223,13 @@ def load_state():
             master  = _records_to_df(rows.get("master_data") or [])
             invoice = _records_to_df(rows.get("invoice_data") or [])
             cfg = rows.get("config") or {}
+            st.session_state._loaded_rev  = int((rows.get("rev") or {}).get("n", 0))
             st.session_state.master_data  = master
             st.session_state.invoice_data = invoice
             st.session_state._storage_mode = f"Supabase (master={len(master)}, invoice={len(invoice)})"
         except Exception as e:
             st.session_state.master_data, st.session_state.invoice_data, cfg = _load_local()
+            st.session_state._loaded_rev = None   # 本番データを読めていないので、この画面からは保存させない
             st.session_state._storage_mode = f"ローカル (Supabaseエラー: {e})"
     else:
         st.session_state.master_data, st.session_state.invoice_data, cfg = _load_local()
@@ -335,7 +410,12 @@ def init_session():
     st.session_state.invoice_data = ensure_deposit_cols(st.session_state.invoice_data)
 
 
+refresh_if_stale()
 init_session()
+if st.session_state.get("_save_conflict_msg"):
+    st.warning(st.session_state.pop("_save_conflict_msg"))
+elif st.session_state.get("_refreshed_this_run"):
+    st.toast("ほかの人の更新を読み込みました")
 
 
 # ─── ヘルパー ────────────────────────────────────────────────────────────────
