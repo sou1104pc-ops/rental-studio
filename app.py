@@ -12,6 +12,7 @@ import io
 import uuid
 from datetime import date, timedelta
 import occupancy as occ
+import card_expense as ce
 
 # ─── ストレージ設定（Supabase優先、なければローカルJSON）─────────────────────
 DATA_DIR     = os.path.join(os.path.dirname(__file__), "data")
@@ -130,6 +131,8 @@ def _save_local(config: dict):
         f.write(_df_to_json(st.session_state.master_data))
     with open(_data_path("invoice_data.json"), "w", encoding="utf-8") as f:
         f.write(_df_to_json(st.session_state.invoice_data))
+    with open(_data_path("expense_data.json"), "w", encoding="utf-8") as f:
+        f.write(_df_to_json(st.session_state.get("expense_data", pd.DataFrame())))
     with open(_data_path("config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
@@ -205,6 +208,9 @@ def save_state():
         "store_mapping":  st.session_state.store_mapping,
         "csv_formats":    st.session_state.get("csv_formats", {}),
         "calendar":       st.session_state.get("calendar", {}),
+        "card_formats":   st.session_state.get("card_formats", {}),
+        "expense_rules":  st.session_state.get("expense_rules", []),
+        "expense_deleted_ids": st.session_state.get("expense_deleted_ids", []),
     }
     conflict = ("ほかの人が先にデータを更新したため、今の操作は保存しませんでした。"
                 "最新のデータを読み込み直したので、もう一度操作してください。")
@@ -223,6 +229,7 @@ def save_state():
         try:
             sb.table("app_storage").upsert({"key": _k("master_data"),  "value": _df_to_records(st.session_state.master_data)}).execute()
             sb.table("app_storage").upsert({"key": _k("invoice_data"), "value": _df_to_records(st.session_state.invoice_data)}).execute()
+            sb.table("app_storage").upsert({"key": _k("expense_data"), "value": _df_to_records(st.session_state.get("expense_data", pd.DataFrame()))}).execute()
             sb.table("app_storage").upsert({"key": _k("config"),       "value": config}).execute()
         except Exception as e:
             _save_local(config)
@@ -247,7 +254,7 @@ def load_state():
     if _use_supabase():
         try:
             sb = _get_supabase()
-            names = ["master_data", "invoice_data", "config", "rev"]
+            names = ["master_data", "invoice_data", "expense_data", "config", "rev"]
             raw = sb.table("app_storage").select("key, value").in_("key", [_k(n) for n in names]).execute().data
             by_key = {r["key"]: r["value"] for r in raw}
             rows = {n: by_key.get(_k(n)) for n in names}   # 自分の会社のデータだけを読む
@@ -255,15 +262,18 @@ def load_state():
             invoice = _records_to_df(rows.get("invoice_data") or [])
             cfg = rows.get("config") or {}
             st.session_state._loaded_rev  = int((rows.get("rev") or {}).get("n", 0))
+            st.session_state.expense_data = _records_to_df(rows.get("expense_data") or [])
             st.session_state.master_data  = master
             st.session_state.invoice_data = invoice
             st.session_state._storage_mode = f"Supabase (master={len(master)}, invoice={len(invoice)})"
         except Exception as e:
             st.session_state.master_data, st.session_state.invoice_data, cfg = _load_local()
+            st.session_state.expense_data = _json_to_df(_data_path("expense_data.json"))
             st.session_state._loaded_rev = None   # 本番データを読めていないので、この画面からは保存させない
             st.session_state._storage_mode = f"ローカル (Supabaseエラー: {e})"
     else:
         st.session_state.master_data, st.session_state.invoice_data, cfg = _load_local()
+        st.session_state.expense_data = _json_to_df(_data_path("expense_data.json"))
         st.session_state._storage_mode = "ローカル (Supabase未設定)"
     st.session_state.stores         = cfg.get("stores",         default_stores())
     # 既存の保存値を優先しつつ、新しく追加した媒体はデフォルト率で補完する
@@ -273,6 +283,9 @@ def load_state():
     st.session_state.store_mapping  = cfg.get("store_mapping",  {})
     st.session_state.csv_formats    = cfg.get("csv_formats",    {})   # 手動登録したCSV列マッピング
     st.session_state.calendar       = cfg.get("calendar",       {})   # Googleカレンダー連携（稼働率）
+    st.session_state.card_formats   = cfg.get("card_formats",   {})   # クレジットカードCSVの列割り当て
+    st.session_state.expense_rules  = cfg.get("expense_rules",  [])   # 利用先キーワード → 科目・店舗・除外
+    st.session_state.expense_deleted_ids = cfg.get("expense_deleted_ids", [])  # 削除した明細（再取込で戻さない）
     st.session_state.state_loaded  = True
 
 st.set_page_config(
@@ -432,6 +445,10 @@ def init_session():
         "store_mapping":  {},
         "csv_formats":    {},
         "calendar":       {},
+        "expense_data":   pd.DataFrame(),
+        "card_formats":   {},
+        "expense_rules":  [],
+        "expense_deleted_ids": [],
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -1181,7 +1198,7 @@ def render_schema_builder(df_raw: pd.DataFrame, key_suffix: str = ""):
 # ─── サイドバー ───────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title(f"🏢 {st.session_state.get('_tenant_name') or '売上管理'}")
-    nav = ["📊 ダッシュボード", "🏪 媒体別売上", "📥 データ取込", "📄 請求書管理",
+    nav = ["📊 ダッシュボード", "🏪 媒体別売上", "📥 データ取込", "📄 請求書管理", "💳 カード経費",
            "🚫 未入金確定", "⚙️ 設定", "📈 損益レポート", "📆 稼働率", "👥 顧客分析", "🔍 予約検索"]
     if is_admin():
         nav.append("🛠 利用者管理")
@@ -2612,7 +2629,15 @@ elif page == "📈 損益レポート":
         monthly["固定費"] = 0
 
     monthly["固定費"]   = monthly["固定費"].fillna(0)
-    monthly["営業利益"] = monthly["手取り"] - monthly["固定費"]
+
+    # クレジットカード経費（「経費にする」の明細だけ）。店舗に割り当てたものは店舗別にも計上
+    _exp = st.session_state.get("expense_data", pd.DataFrame())
+    card_inc = _exp[_exp["経費"] == True] if not _exp.empty and "経費" in _exp.columns else pd.DataFrame(columns=ce.EXPENSE_COLS)
+    card_store = (card_inc[card_inc["店舗"] != ce.BUSINESS_WIDE]
+                  .groupby(["月", "店舗"], as_index=False)["金額"].sum().rename(columns={"金額": "カード経費"}))
+    monthly = monthly.merge(card_store, on=["月", "店舗"], how="left")
+    monthly["カード経費"] = monthly["カード経費"].fillna(0)
+    monthly["営業利益"] = monthly["手取り"] - monthly["固定費"] - monthly["カード経費"]
 
     total = (
         monthly.groupby("月")
@@ -2630,11 +2655,14 @@ elif page == "📈 損益レポート":
     else:
         total["事業経費"] = 0
     total["事業経費"] = total["事業経費"].fillna(0)
-    total["営業利益"] = total["手取り"] - total["固定費"] - total["事業経費"]
+    card_month = card_inc.groupby("月", as_index=False)["金額"].sum().rename(columns={"金額": "カード経費"})
+    total = total.merge(card_month, on="月", how="left")
+    total["カード経費"] = total["カード経費"].fillna(0)
+    total["営業利益"] = total["手取り"] - total["固定費"] - total["事業経費"] - total["カード経費"]
 
     tab_all, *tab_stores = st.tabs(["🌐 事業全体"] + st.session_state.stores)
 
-    fmt_cols = {col: fmt_yen for col in ["売上", "割引", "返金", "実売上", "手数料", "手取り", "固定費", "事業経費", "営業利益"]}
+    fmt_cols = {col: fmt_yen for col in ["売上", "割引", "返金", "実売上", "手数料", "手取り", "固定費", "事業経費", "カード経費", "営業利益"]}
 
     def show_table(df_view: pd.DataFrame):
         valid_fmt = {k: v for k, v in fmt_cols.items() if k in df_view.columns}
@@ -2649,6 +2677,8 @@ elif page == "📈 損益レポート":
         fig.add_bar(x=df_view["月"], y=df_view["固定費"], name="店舗固定費", marker_color="#F28B82")
         if show_business_cost and "事業経費" in df_view.columns:
             fig.add_bar(x=df_view["月"], y=df_view["事業経費"], name="事業全体経費", marker_color="#FBBC04")
+        if "カード経費" in df_view.columns and df_view["カード経費"].sum():
+            fig.add_bar(x=df_view["月"], y=df_view["カード経費"], name="カード経費", marker_color="#A142F4")
         fig.add_scatter(x=df_view["月"], y=df_view["営業利益"], name="営業利益",
                         mode="lines+markers", line=dict(color="#34A853", width=2))
         fig.update_layout(title=title, barmode="group", hovermode="x unified")
@@ -2656,17 +2686,21 @@ elif page == "📈 損益レポート":
 
     with tab_all:
         st.subheader("事業全体 損益サマリー")
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
         c1.metric("累計売上",     fmt_yen(total["売上"].sum()))
         c2.metric("累計返金",     fmt_yen(total["返金"].sum()))
         c3.metric("累計実売上",   fmt_yen(total["実売上"].sum()))
         c4.metric("累計店舗固定費", fmt_yen(total["固定費"].sum()))
         c5.metric("累計事業経費", fmt_yen(total["事業経費"].sum()))
+        c6.metric("累計カード経費", fmt_yen(total["カード経費"].sum()))
         profit_all = total["営業利益"].sum()
-        c6.metric("累計営業利益", fmt_yen(profit_all),
+        c7.metric("累計営業利益", fmt_yen(profit_all),
                   delta=("黒字" if profit_all >= 0 else "赤字"),
                   delta_color=("normal" if profit_all >= 0 else "inverse"))
-        show_table(total[["月", "売上", "割引", "返金", "実売上", "手数料", "手取り", "固定費", "事業経費", "営業利益", "件数"]])
+        show_table(total[["月", "売上", "割引", "返金", "実売上", "手数料", "手取り", "固定費", "事業経費", "カード経費", "営業利益", "件数"]])
+        if not card_inc.empty:
+            st.caption("※ カード経費は「💳 カード経費」で「経費にする」にした明細です。"
+                       "事業全体経費に手入力した分と同じ支払いを二重に計上していないか注意してください。")
         pl_chart(total, "事業全体 月別損益推移", show_business_cost=True)
         fig_cmp = px.bar(monthly, x="月", y="営業利益", color="店舗",
                          title="店舗別 営業利益比較", barmode="group")
@@ -2687,7 +2721,7 @@ elif page == "📈 損益レポート":
             c4.metric("累計営業利益", fmt_yen(p),
                       delta=("黒字" if p >= 0 else "赤字"),
                       delta_color=("normal" if p >= 0 else "inverse"))
-            show_table(sd[["月", "売上", "割引", "返金", "実売上", "手数料", "手取り", "固定費", "営業利益", "件数"]])
+            show_table(sd[["月", "売上", "割引", "返金", "実売上", "手数料", "手取り", "固定費", "カード経費", "営業利益", "件数"]])
             pl_chart(sd, f"{store} 月別損益推移")
 
     st.divider()
@@ -2697,6 +2731,8 @@ elif page == "📈 損益レポート":
             total.to_excel(writer,   sheet_name="事業全体損益", index=False)
             monthly.to_excel(writer, sheet_name="店舗別損益",   index=False)
             df.to_excel(writer,      sheet_name="明細データ",   index=False)
+            if not card_inc.empty:
+                card_inc.drop(columns=["明細ID"], errors="ignore").to_excel(writer, sheet_name="カード経費明細", index=False)
             # 未入金確定（貸倒）は売上に含めないので、参考として別シートに出力する
             if bad_pl is not None:
                 bad_cols = [c for c in ["元データ", "請求書番号", "予約ID", "月", "利用日", "店舗", "顧客名",
@@ -3067,6 +3103,209 @@ elif page == "🔍 予約検索":
             show_cols = [c for c in ["予約ID", "利用日", "顧客名", "店舗", "プラットフォーム",
                                       "決済方法", "売上", "返金", "実売上"] if c in refunded.columns]
             st.dataframe(refunded[show_cols], use_container_width=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 💳 カード経費
+# ════════════════════════════════════════════════════════════════════════════
+elif page == "💳 カード経費":
+    st.title("💳 カード経費")
+    st.caption("クレジットカードの明細CSVを取り込み、経費を集計します。私用など経費でない明細は"
+               "「経費にする」のチェックを外すか、削除してください。経費は「📈 損益レポート」に反映されます。")
+    if st.session_state.pop("_card_msg", None):
+        st.success(st.session_state.pop("_card_msg_text", "保存しました"))
+
+    exp = st.session_state.expense_data
+    if exp is None or exp.empty:
+        exp = pd.DataFrame(columns=ce.EXPENSE_COLS)
+    store_opts = [ce.BUSINESS_WIDE] + list(st.session_state.stores)
+    categories = list(dict.fromkeys(ce.EXPENSE_CATEGORIES + [c for c in exp["科目"].dropna().unique() if c]))
+
+    t_imp, t_list, t_sum, t_rule = st.tabs(["📥 取り込み", "📋 明細・仕分け", "📊 集計", "⚙️ 自動仕分けルール"])
+
+    # ── 取り込み ──
+    with t_imp:
+        st.markdown("カード会社のWeb明細から**CSVをダウンロード**して、ここに入れてください。"
+                    "どのカード会社のCSVでも、日付・利用先・金額の列を自動で探します。")
+        up = st.file_uploader("カード明細のCSV", type=["csv"], key="card_csv")
+        if up is not None:
+            rows = ce.read_rows(ce.decode_csv(up.getvalue()))
+            if not rows:
+                st.error("CSVの中身を読み取れませんでした。")
+            else:
+                hdr = ce.find_header(rows)
+                df_raw = ce.to_frame(rows, hdr)
+                sig = ce.signature(df_raw, hdr)
+                saved = st.session_state.card_formats.get(sig, {})
+                guess = ce.guess_columns(df_raw)
+                for k in ("date", "desc", "amount"):
+                    if saved.get(k) in df_raw.columns:
+                        guess[k] = saved[k]
+                with st.expander("CSVの中身（先頭）", expanded=False):
+                    st.dataframe(df_raw.head(8), use_container_width=True)
+                cols = list(df_raw.columns)
+
+                def _ix(c):
+                    return cols.index(c) if c in cols else 0
+
+                c1, c2, c3 = st.columns(3)
+                date_c = c1.selectbox("日付の列", cols, index=_ix(guess["date"]), key=f"cc_date_{sig}")
+                desc_c = c2.selectbox("利用先の列", cols, index=_ix(guess["desc"]), key=f"cc_desc_{sig}")
+                amt_c  = c3.selectbox("金額の列", cols, index=_ix(guess["amount"]), key=f"cc_amt_{sig}")
+                card = st.text_input("カード名", value=saved.get("card", ""), key=f"cc_card_{sig}",
+                                     placeholder="例: 楽天カード（事業用）",
+                                     help="同じカード会社のCSVは、次回から列とカード名を覚えています")
+                mapping = {"date": date_c, "desc": desc_c, "amount": amt_c}
+                preview, skipped = ce.build_expenses(df_raw, mapping, card.strip() or "カード",
+                                                     st.session_state.expense_rules)
+                known = set(exp["明細ID"].astype(str)) | set(st.session_state.expense_deleted_ids)
+                new = preview[~preview["明細ID"].isin(known)]
+                st.write(f"読み取れた明細 **{len(preview)} 件**（新規 {len(new)} 件 ／ 取込済み・削除済み "
+                         f"{len(preview) - len(new)} 件 ／ 日付か金額が読めない行 {skipped} 件）")
+                if preview.empty:
+                    st.warning("明細を読み取れませんでした。日付・金額の列の選び方を確認してください。")
+                elif not new.empty:
+                    st.dataframe(
+                        new[["利用日", "利用先", "金額", "科目", "店舗", "経費"]].head(30)
+                           .style.format({"金額": fmt_yen, "利用日": lambda d: f"{d:%Y/%m/%d}"}),
+                        hide_index=True, use_container_width=True)
+                    if not new["経費"].all():
+                        st.caption(f"自動仕分けルールで {int((~new['経費']).sum())} 件を経費から除外しています。")
+                if st.button(f"✅ {len(new)} 件を取り込む", key="card_import",
+                             disabled=new.empty or not card.strip()):
+                    st.session_state.card_formats[sig] = {**mapping, "card": card.strip()}
+                    st.session_state.expense_data = pd.concat([exp, new], ignore_index=True) if not exp.empty else new
+                    save_state()
+                    st.session_state._card_msg = True
+                    st.session_state._card_msg_text = (f"{card.strip()}: {len(new)} 件を取り込みました。"
+                                                       "「📋 明細・仕分け」で経費でないものを外してください。")
+                    st.rerun()
+                if not card.strip():
+                    st.caption("カード名を入力すると取り込めます。")
+
+    # ── 明細・仕分け ──
+    with t_list:
+        if exp.empty:
+            st.info("まだ明細がありません。「📥 取り込み」からCSVを取り込んでください。")
+        else:
+            months = sorted([m for m in exp["月"].dropna().unique() if m], reverse=True)
+            f1, f2, f3 = st.columns([1, 1, 2])
+            sel_m = f1.selectbox("月", ["すべて"] + months, key="ex_month")
+            sel_card = f2.selectbox("カード", ["すべて"] + sorted(exp["カード"].dropna().unique()), key="ex_card")
+            sel_kind = f3.radio("表示", ["すべて", "経費のみ", "除外のみ"], horizontal=True, key="ex_kind")
+            view = exp
+            if sel_m != "すべて":
+                view = view[view["月"] == sel_m]
+            if sel_card != "すべて":
+                view = view[view["カード"] == sel_card]
+            if sel_kind == "経費のみ":
+                view = view[view["経費"] == True]
+            elif sel_kind == "除外のみ":
+                view = view[view["経費"] != True]
+            view = view.sort_values("利用日", ascending=False)
+            inc = view[view["経費"] == True]["金額"].sum()
+            excl = view[view["経費"] != True]["金額"].sum()
+            st.caption(f"表示中 {len(view):,} 件　経費 {fmt_yen(inc)}　除外 {fmt_yen(excl)}")
+
+            edit_cols = ["経費", "利用日", "利用先", "金額", "カード", "科目", "店舗", "メモ"]
+            ed_df = view[edit_cols].copy()
+            ed_df["経費"] = ed_df["経費"].fillna(False).astype(bool)
+            ed_df["メモ"] = ed_df["メモ"].fillna("").astype(str)
+            ed_df.insert(0, "削除", False)
+            ed_df.index = view["明細ID"].astype(str)
+            edited = st.data_editor(
+                ed_df, hide_index=True, use_container_width=True,
+                key=f"ex_editor_{sel_m}_{sel_card}_{sel_kind}",
+                disabled=["利用日", "利用先", "金額", "カード"],
+                column_config={
+                    "削除": st.column_config.CheckboxColumn("削除", help="チェックして保存すると明細から消えます（同じCSVを取り込み直しても戻りません）"),
+                    "経費": st.column_config.CheckboxColumn("経費にする", help="外すと経費から除外（データは残ります）"),
+                    "利用日": st.column_config.DateColumn("利用日", format="YYYY/MM/DD"),
+                    "金額": st.column_config.NumberColumn("金額", format="¥%d"),
+                    "科目": st.column_config.SelectboxColumn("科目", options=categories),
+                    "店舗": st.column_config.SelectboxColumn("店舗", options=store_opts),
+                    "メモ": st.column_config.TextColumn("メモ"),
+                })
+            cmp_cols = ["削除", "経費", "科目", "店舗", "メモ"]
+            changed = edited[cmp_cols].astype(str).ne(ed_df[cmp_cols].astype(str)).any(axis=1)
+            n_changed, n_del = int(changed.sum()), int(edited["削除"].sum())
+            label = f"💾 変更を保存（{n_changed} 件" + (f"、うち削除 {n_del} 件" if n_del else "") + "）"
+            if st.button(label, key="ex_save", disabled=n_changed == 0, type="primary"):
+                full = st.session_state.expense_data.copy()
+                full.index = full["明細ID"].astype(str)
+                for mid in edited.index[changed]:
+                    for c in ["経費", "科目", "店舗", "メモ"]:
+                        full.at[mid, c] = edited.at[mid, c]
+                del_ids = list(edited.index[edited["削除"] == True])
+                if del_ids:
+                    full = full.drop(index=del_ids)
+                    st.session_state.expense_deleted_ids = list(dict.fromkeys(
+                        list(st.session_state.expense_deleted_ids) + del_ids))
+                st.session_state.expense_data = full.reset_index(drop=True)
+                save_state()
+                st.session_state._card_msg = True
+                st.session_state._card_msg_text = f"{n_changed} 件の変更を保存しました。"
+                st.rerun()
+
+    # ── 集計 ──
+    with t_sum:
+        inc_df = exp[exp["経費"] == True] if not exp.empty else exp
+        if inc_df.empty:
+            st.info("経費の明細がまだありません。")
+        else:
+            excl_df = exp[exp["経費"] != True]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("経費合計", fmt_yen(inc_df["金額"].sum()))
+            c2.metric("経費の件数", f"{len(inc_df):,} 件")
+            c3.metric("除外した金額", fmt_yen(excl_df["金額"].sum()))
+            by_cat = inc_df.pivot_table(index="月", columns="科目", values="金額", aggfunc="sum", fill_value=0)
+            by_cat["合計"] = by_cat.sum(axis=1)
+            st.markdown("**月別 × 科目**")
+            st.dataframe(by_cat.sort_index(ascending=False).style.format(fmt_yen), use_container_width=True)
+            fig = px.bar(inc_df.groupby(["月", "科目"], as_index=False)["金額"].sum(),
+                         x="月", y="金額", color="科目", title="月別のカード経費（科目別）")
+            st.plotly_chart(fig, use_container_width=True)
+            by_store = inc_df.pivot_table(index="月", columns="店舗", values="金額", aggfunc="sum", fill_value=0)
+            st.markdown("**月別 × 店舗**（「事業全体」は店舗に割り当てていない経費）")
+            st.dataframe(by_store.sort_index(ascending=False).style.format(fmt_yen), use_container_width=True)
+
+    # ── 自動仕分けルール ──
+    with t_rule:
+        st.markdown("利用先にキーワードを含む明細を、取り込むときに自動で仕分けます（上のルールほど優先）。"
+                    "私用でよく使うお店は「除外」にしておくと、毎回外す手間がなくなります。")
+        rules_df = pd.DataFrame(st.session_state.expense_rules, columns=["キーワード", "処理", "科目", "店舗"])
+        edited_rules = st.data_editor(
+            rules_df, num_rows="dynamic", hide_index=True, use_container_width=True, key="ex_rules",
+            column_config={
+                "キーワード": st.column_config.TextColumn("キーワード（利用先に含む文字）", required=True),
+                "処理": st.column_config.SelectboxColumn("処理", options=["経費", "除外"], required=True, default="経費"),
+                "科目": st.column_config.SelectboxColumn("科目", options=categories),
+                "店舗": st.column_config.SelectboxColumn("店舗", options=store_opts),
+            })
+        r1, r2 = st.columns(2)
+        if r1.button("ルールを保存", key="ex_rules_save"):
+            clean = []
+            for r in edited_rules.to_dict("records"):
+                kw = str(r.get("キーワード") or "").strip()
+                if kw:
+                    clean.append({"キーワード": kw, "処理": r.get("処理") or "経費",
+                                  "科目": r.get("科目") or "", "店舗": r.get("店舗") or ""})
+            st.session_state.expense_rules = clean
+            save_state()
+            st.session_state._card_msg = True
+            st.session_state._card_msg_text = f"ルールを {len(clean)} 件保存しました（次の取り込みから使われます）。"
+            st.rerun()
+        if r2.button("保存済みのルールを、取り込み済みの明細にも当てはめる", key="ex_rules_apply",
+                     disabled=exp.empty or not st.session_state.expense_rules,
+                     help="キーワードに当てはまる明細の科目・店舗・経費/除外を、ルールどおりに上書きします"):
+            recs = [ce.apply_rules(r, st.session_state.expense_rules) for r in exp.to_dict("records")]
+            new_exp = pd.DataFrame(recs, columns=exp.columns)
+            n = int((new_exp[["経費", "科目", "店舗"]].astype(str) != exp[["経費", "科目", "店舗"]].astype(str)).any(axis=1).sum())
+            st.session_state.expense_data = new_exp
+            save_state()
+            st.session_state._card_msg = True
+            st.session_state._card_msg_text = f"ルールを当てはめて {n} 件を更新しました。"
+            st.rerun()
 
 
 # ════════════════════════════════════════════════════════════════════════════
