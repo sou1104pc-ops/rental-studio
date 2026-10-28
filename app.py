@@ -2961,6 +2961,15 @@ elif page == "👥 顧客分析":
         st.warning("データがありません。")
         st.stop()
 
+    # 店舗で絞り込む（設定の店舗 ∪ データに実在する店舗）
+    data_stores = [s for s in df["店舗"].dropna().astype(str).unique() if s.strip()]
+    store_opts  = [s for s in st.session_state.stores if s in data_stores] + \
+                  [s for s in data_stores if s not in st.session_state.stores]
+    sel_store = st.selectbox("店舗", ["全店舗"] + store_opts, key="cust_store",
+                             help="店舗を選ぶと、その店舗での利用だけで顧客数・リピート率などを集計します。")
+    if sel_store != "全店舗":
+        df = df[df["店舗"] == sel_store]
+
     df_c = df[df["顧客名"].notna() & ~df["顧客名"].isin(["不明", ""])].copy()
     if df_c.empty:
         st.warning("顧客名のデータがありません。")
@@ -2990,7 +2999,8 @@ elif page == "👥 顧客分析":
 
     st.divider()
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 ランキング", "📅 月別推移", "🗺️ 利用傾向", "📋 顧客一覧"])
+    tab1, tab2, tab3, tab_plat, tab4 = st.tabs(
+        ["📊 ランキング", "📅 月別推移", "🗺️ 利用傾向", "📱 予約サイト別", "📋 顧客一覧"])
 
     with tab1:
         c1, c2 = st.columns(2)
@@ -3049,6 +3059,45 @@ elif page == "👥 顧客分析":
             fig3 = px.bar(wk, x="曜日JP", y="件数", title="曜日別 利用件数",
                           color="件数", color_continuous_scale="Oranges")
             st.plotly_chart(fig3, use_container_width=True)
+
+    with tab_plat:
+        st.caption("「初回の予約サイト」＝その顧客が最初に予約したサイト。"
+                   "リピート率は、そのサイトから来た顧客のうち2回以上利用した人の割合です"
+                   "（2回目以降はどのサイト経由でも数えます）。")
+        first_plat = (df_c.sort_values("利用日").groupby("顧客名")["プラットフォーム"].first()
+                      .rename("初回の予約サイト"))
+        cs = cust_stats.merge(first_plat, left_on="顧客名", right_index=True)
+        plat_rep = (cs.groupby("初回の予約サイト")
+                    .agg(顧客数=("顧客名", "count"), リピーター数=("リピーター", "sum"))
+                    .reset_index())
+        plat_rep["リピート率"] = (plat_rep["リピーター数"] / plat_rep["顧客数"] * 100).round(1)
+        plat_rep["顧客構成比"] = (plat_rep["顧客数"] / plat_rep["顧客数"].sum() * 100).round(1)
+
+        plat_bk = (df_c.groupby("プラットフォーム")
+                   .agg(予約件数=("予約ID", "count"), 実売上=("実売上", "sum"))
+                   .reset_index())
+        plat_bk["件数構成比"] = (plat_bk["予約件数"] / plat_bk["予約件数"].sum() * 100).round(1)
+        plat_bk["売上構成比"] = (plat_bk["実売上"] / plat_bk["実売上"].sum() * 100).round(1) \
+            if plat_bk["実売上"].sum() else 0.0
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**初回の予約サイト別 リピート率**")
+            st.dataframe(plat_rep.sort_values("顧客数", ascending=False).style.format(
+                {"リピート率": "{:.1f}%", "顧客構成比": "{:.1f}%"}),
+                hide_index=True, use_container_width=True)
+            fig = px.bar(plat_rep, x="初回の予約サイト", y="リピート率", text="リピート率",
+                         title="初回の予約サイト別 リピート率（%）", color="初回の予約サイト")
+            fig.update_traces(texttemplate="%{text:.1f}%")
+            st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            st.markdown("**予約サイト別 予約件数・売上の割合**")
+            st.dataframe(plat_bk.sort_values("予約件数", ascending=False).style.format(
+                {"実売上": fmt_yen, "件数構成比": "{:.1f}%", "売上構成比": "{:.1f}%"}),
+                hide_index=True, use_container_width=True)
+            st.plotly_chart(px.pie(plat_bk, values="予約件数", names="プラットフォーム",
+                                   title="予約サイト別 予約件数の割合"),
+                            use_container_width=True)
 
     with tab4:
         search = st.text_input("顧客名で検索", placeholder="名前を入力...")
