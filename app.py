@@ -617,7 +617,8 @@ def parse_amount(series: pd.Series) -> pd.Series:
     """¥記号・カンマ・「円」などを除去して数値に変換（半角・全角どちらも対応）"""
     return pd.to_numeric(
         series.astype(str)
-              .apply(lambda v: unicodedata.normalize("NFKC", v))
+              # 新しい pandas では空欄が astype(str) 後も NaN のまま残るので str() で文字列にする
+              .apply(lambda v: unicodedata.normalize("NFKC", str(v)))
               .str.replace(r"[^\d.\-]", "", regex=True)   # ¥ , 円 空白 などを除去
               .replace({"": None, "-": None, ".": None}),
         errors="coerce",
