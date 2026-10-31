@@ -13,7 +13,6 @@ import uuid
 from datetime import date, timedelta
 import occupancy as occ
 import card_expense as ce
-import screenshot_import as shot
 
 # ─── ストレージ設定（Supabase優先、なければローカルJSON）─────────────────────
 DATA_DIR     = os.path.join(os.path.dirname(__file__), "data")
@@ -1784,7 +1783,7 @@ elif page == "📥 データ取込":
         st.caption(f"手数料率 **{m_rate}%** で手取りを計算します（設定 → 💳 手数料設定 で変更）。"
                    "「手取り（振込額）」を入力した行は、その実額を優先します。")
 
-    tab_edit, tab_paste, tab_shot = st.tabs(["⌨️ 1件ずつ入力", "📋 貼り付けて取込", "📸 スクショから取込"])
+    tab_edit, tab_paste = st.tabs(["⌨️ 1件ずつ入力", "📋 貼り付けて取込"])
 
     with tab_edit:
         with st.form("manual_single_form"):
@@ -1880,84 +1879,6 @@ elif page == "📥 データ取込":
                         st.warning(f"すべて登録済みでした（{dup_cnt:,} 件）")
                     else:
                         st.info("登録できる行がありませんでした。")
-
-    with tab_shot:
-        st.caption("予約管理画面の予約一覧をスクショしてアップロードすると、AIが読み取って売上の表にします。"
-                   "内容を確認・修正してから登録してください。")
-        try:
-            shot_key = st.secrets.get("anthropic", {}).get("api_key", "")
-        except Exception:
-            shot_key = ""
-        if not shot_key:
-            st.info("スクショの読み取りには Claude の APIキーが必要です。Streamlit の「Settings」→「Secrets」に"
-                    "次を追記してください。\n\n```toml\n[anthropic]\napi_key = \"sk-ant-...\"\n```")
-        else:
-            shots = st.file_uploader("スクショ（複数可）", type=["png", "jpg", "jpeg", "webp"],
-                                     accept_multiple_files=True, key="shot_files")
-            if shots and st.button(f"🔍 {len(shots)} 枚を読み取る", key="shot_read"):
-                with st.spinner("読み取り中…（数十秒かかることがあります）"):
-                    try:
-                        found = shot.read_bookings(shot_key, [(f.name, f.getvalue()) for f in shots], m_platform)
-                    except shot.ScreenshotReadError as e:
-                        st.error(str(e))
-                        found = None
-                if found is not None:
-                    st.session_state.shot_rows = pd.DataFrame([{
-                        # キャンセルは売上にしないので、初期状態では取込対象から外す
-                        "取込む":   "キャンセル" not in str(b.get("ステータス", "")),
-                        "利用日":   pd.to_datetime(b.get("利用日"), errors="coerce"),
-                        "店舗":     apply_store_mapping(m_platform, b.get("スペース名", "")),
-                        "顧客名":   b.get("顧客名", ""),
-                        "売上":     b.get("金額", 0),
-                        "決済方法": b.get("決済方法", ""),
-                        "ステータス": b.get("ステータス", ""),
-                        "画面のスペース名": b.get("スペース名", ""),
-                    } for b in found])
-                    st.session_state.shot_platform = m_platform
-
-            shot_rows = st.session_state.get("shot_rows")
-            if shot_rows is not None:
-                if shot_rows.empty:
-                    st.warning("予約を読み取れませんでした。予約一覧が写ったスクショか確認してください。")
-                else:
-                    st.caption(f"{len(shot_rows)} 件読み取りました（媒体: {st.session_state.shot_platform}）。"
-                               "間違いがあれば表を直接直してください。")
-                    edited = st.data_editor(
-                        shot_rows, hide_index=True, use_container_width=True, key="shot_editor",
-                        disabled=["ステータス", "画面のスペース名"],
-                        column_config={
-                            "取込む": st.column_config.CheckboxColumn("取込む"),
-                            "利用日": st.column_config.DateColumn("利用日"),
-                            "店舗":   st.column_config.SelectboxColumn("店舗", options=st.session_state.stores),
-                            "売上":   st.column_config.NumberColumn("売上", format="¥%d", min_value=0),
-                        },
-                    )
-                    todo = edited[edited["取込む"] == True]
-                    bad_store = todo[~todo["店舗"].isin(st.session_state.stores)]
-                    if not bad_store.empty:
-                        st.warning(f"⚠️ {len(bad_store)} 件は店舗が分かりません。表の「店舗」を選んでください。")
-                    sc1, sc2 = st.columns([2, 1])
-                    with sc1:
-                        go_shot = st.button(f"✅ {len(todo)} 件 / {fmt_yen(pd.to_numeric(todo['売上'], errors='coerce').fillna(0).sum())} を登録",
-                                            key="shot_register", disabled=todo.empty or not bad_store.empty)
-                    with sc2:
-                        if st.button("やり直す", key="shot_clear"):
-                            st.session_state.pop("shot_rows", None)
-                            st.rerun()
-                    if go_shot:
-                        rows = todo.assign(**{"手取り（振込額）": None})[MANUAL_COLS].reset_index(drop=True)
-                        new_cnt, dup_cnt, skipped = register_manual_rows(st.session_state.shot_platform, rows)
-                        for s_ in skipped:
-                            st.warning(s_)
-                        if new_cnt > 0:
-                            st.session_state.pop("shot_rows", None)
-                            st.session_state._import_msg = (f"スクショから {new_cnt:,} 件を登録しました"
-                                                            f"（重複スキップ: {dup_cnt:,} 件）")
-                            save_state()
-                            _rebuild_cache()
-                            st.rerun()
-                        elif dup_cnt > 0:
-                            st.warning(f"すべて登録済みでした（{dup_cnt:,} 件）")
 
     # 手入力データの確認・削除
     md_manual = st.session_state.master_data
