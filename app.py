@@ -951,6 +951,170 @@ def process_csv(df_raw: pd.DataFrame, platform: str) -> Tuple[int, int]:
     return new_count, dup_count
 
 
+# ─── よやクル 支払いリンク ────────────────────────────────────────────────────
+# よやクルの支払いリンク経由の支払い一覧CSV。店舗・利用日の列が無いので、
+# 「問い合わせ番号」で取込済みのよやクル予約（決済ID）と突き合わせて補う。
+YOYAKURU_LINK_SIGNATURE = ["問い合わせ番号", "支払いID", "お支払い完了日時"]
+YOYAKURU_LINK_PREFIX    = "PL-"   # 新規に追加する行の予約ID（支払いIDの前に付ける）
+
+
+def is_yoyakuru_link_csv(cols: list) -> bool:
+    return all(c in cols for c in YOYAKURU_LINK_SIGNATURE)
+
+
+def prepare_yoyakuru_link(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """支払いリンクCSVの各行を、取込済みデータと突き合わせて処理内容を決める。
+    処理: 新規追加 / 予約を入金済みに更新 / 計上済みのためスキップ / 支払い済みでないためスキップ"""
+    md = st.session_state.master_data
+    yk = md[md["プラットフォーム"] == "よやクル"] if not md.empty else md
+
+    def _s(v) -> str:
+        return "" if pd.isna(v) else str(v).strip()
+
+    def _num(col: str) -> pd.Series:
+        if col not in df_raw.columns:
+            return pd.Series(pd.NA, index=df_raw.index)
+        return parse_amount(df_raw[col].fillna("").astype(str))
+
+    amounts, refunds, nets = _num("金額").fillna(0), _num("返金額").fillna(0).abs(), _num("利益")
+
+    rows = []
+    for k, r in df_raw.iterrows():
+        pay_id  = _s(r.get("支払いID"))
+        inq     = _s(r.get("問い合わせ番号"))
+        if not pay_id and not inq:
+            continue
+        amount, refund, net = float(amounts[k]), float(refunds[k]), nets[k]
+        actual  = amount - refund
+        net     = actual if pd.isna(net) else net
+        paid_at = parse_manual_dates(pd.Series([r.get("お支払い完了日時")])).iloc[0]
+        if pd.isna(paid_at):
+            paid_at = parse_manual_dates(pd.Series([r.get("作成日時")])).iloc[0]
+        status  = _s(r.get("状態"))
+        method  = _s(r.get("支払い方法")) or "不明"
+        customer = _s(r.get("顧客名(HN)")) or "不明"
+
+        match_idx, store, usage = None, "", (paid_at.normalize() if pd.notna(paid_at) else pd.NaT)
+        if not yk.empty and inq:
+            hit = yk[yk["予約ID"].astype(str) == inq]
+            if not hit.empty:
+                match_idx = hit.index[0]
+                store = _s(hit.iloc[0].get("店舗"))
+                if pd.notna(hit.iloc[0].get("利用日")):
+                    usage = hit.iloc[0]["利用日"]
+                # 顧客分析で同じ人として数えるため、予約側の顧客名に揃える
+                customer = _s(hit.iloc[0].get("顧客名")) or customer
+        # 支払いリンクCSVのHNは「(名前)」と括弧で囲まれていることがある
+        m_paren = re.fullmatch(r"[(（](.*)[)）]", customer)
+        if match_idx is None and m_paren:
+            customer = m_paren.group(1).strip() or customer
+
+        if "支払い済み" not in status:
+            action = "支払い済みでないためスキップ"
+        elif not yk.empty and (yk["予約ID"].astype(str) == YOYAKURU_LINK_PREFIX + pay_id).any():
+            action = "計上済みのためスキップ"
+        elif match_idx is not None:
+            m = md.loc[match_idx]
+            confirmed = bool(m.get("確認済み")) and not (m.get("入金ステータス") == BAD_DEBT_STATUS)
+            m_actual = float(m.get("実売上") or 0)
+            if not confirmed or m_actual == 0:
+                action = "予約を入金済みに更新"
+            elif abs(m_actual - actual) < 1:
+                action = "計上済みのためスキップ"
+            else:
+                action = "新規追加"      # 予約とは別の追加支払い（金額が違う）
+        else:
+            action = "新規追加"
+
+        rows.append({
+            "処理": action, "支払いID": pay_id, "問い合わせ番号": inq, "顧客名": customer,
+            "理由": _s(r.get("理由")), "店舗": store, "利用日": usage, "支払日": paid_at,
+            "支払い方法": method, "売上": amount, "返金": refund, "実売上": actual, "手取り": net,
+            "_match": match_idx,
+        })
+    return pd.DataFrame(rows)
+
+
+def apply_yoyakuru_link(prep: pd.DataFrame) -> Tuple[int, int]:
+    """prepare_yoyakuru_link の結果を master_data に反映。（追加件数, 更新件数）を返す"""
+    md = st.session_state.master_data.copy()
+    added, updated = [], 0
+    for _, r in prep.iterrows():
+        method = f"支払いリンク（{r['支払い方法']}）"
+        fee    = max(float(r["実売上"]) - float(r["手取り"]), 0.0)
+        rate   = round(fee / r["実売上"] * 100, 1) if r["実売上"] else 0.0
+        if r["処理"] == "予約を入金済みに更新":
+            i = r["_match"]
+            for col, val in {"決済方法": method, "売上": float(r["売上"]), "割引": 0.0,
+                             "返金": float(r["返金"]), "実売上": float(r["実売上"]),
+                             "手数料率": rate, "手数料": fee, "手取り": float(r["手取り"]),
+                             "支払日": r["支払日"], "確認済み": True, "入金額": float(r["実売上"]),
+                             "入金ステータス": "入金済み", "未入金確定日": pd.NaT}.items():
+                md.at[i, col] = val
+            updated += 1
+        elif r["処理"] == "新規追加":
+            usage = pd.Timestamp(r["利用日"]) if pd.notna(r["利用日"]) else pd.NaT
+            added.append({
+                "利用日": usage, "支払日": r["支払日"],
+                "月": usage.strftime("%Y-%m") if pd.notna(usage) else None,
+                "店舗": r["店舗"], "顧客名": r["顧客名"],
+                "予約ID": YOYAKURU_LINK_PREFIX + r["支払いID"], "決済方法": method,
+                "売上": float(r["売上"]), "割引": 0.0, "返金": float(r["返金"]),
+                "実売上": float(r["実売上"]), "手数料率": rate, "手数料": fee,
+                "手取り": float(r["手取り"]), "プラットフォーム": "よやクル",
+                "データ種別": "CSV", "確認済み": True,
+            })
+    if added:
+        md = pd.concat([md, pd.DataFrame(added)], ignore_index=True)
+    st.session_state.master_data = md.reset_index(drop=True)
+    return len(added), updated
+
+
+def render_yoyakuru_link_import(df_raw: pd.DataFrame, file_key: str):
+    """データ取込画面：よやクル支払いリンクCSVの確認・取込"""
+    st.success("✅ **よやクル（支払いリンク）** と判別")
+    st.caption("「問い合わせ番号」で取込済みのよやクル予約と突き合わせ、店舗・利用日を引き継ぎます。"
+               "先によやクルの決済CSVを取込んでおくと、自動で店舗が入ります。")
+    prep = prepare_yoyakuru_link(df_raw)
+    if prep.empty:
+        st.warning("取込める行がありません。")
+        return
+
+    stores = list(st.session_state.stores)
+    need_store = (prep["処理"] == "新規追加") & (prep["店舗"] == "")
+    if need_store.any():
+        st.warning(f"⚠️ {int(need_store.sum())} 件は予約が見つからず店舗が分かりません。下の表で「店舗」を選んでください。")
+    show_cols = ["処理", "店舗", "利用日", "顧客名", "理由", "実売上", "支払い方法", "支払日", "問い合わせ番号"]
+    edited = st.data_editor(
+        prep[show_cols], hide_index=True, use_container_width=True, key=f"plink_{file_key}",
+        disabled=[c for c in show_cols if c not in ("店舗", "利用日")],
+        column_config={
+            "店舗":   st.column_config.SelectboxColumn("店舗", options=stores),
+            "利用日": st.column_config.DateColumn("利用日"),
+            "実売上": st.column_config.NumberColumn("金額", format="¥%d"),
+        },
+    )
+    prep["店舗"] = edited["店舗"].fillna("").values
+    prep["利用日"] = pd.to_datetime(edited["利用日"], errors="coerce").values
+
+    todo = prep[prep["処理"].isin(["新規追加", "予約を入金済みに更新"])]
+    st.caption("　".join(f"{k}: {v} 件" for k, v in prep["処理"].value_counts().items()))
+    missing = (todo["処理"] == "新規追加") & (todo["店舗"] == "")
+    if todo.empty:
+        st.info("新しく反映するものはありません。")
+    elif missing.any():
+        st.button("✅ よやクルに反映する", key=f"plink_btn_{file_key}", disabled=True,
+                  help="店舗が空の行があります")
+    elif st.button(f"✅ よやクルに反映する（{len(todo)} 件 / {fmt_yen(todo['実売上'].sum())}）",
+                   key=f"plink_btn_{file_key}"):
+        n_add, n_upd = apply_yoyakuru_link(prep)
+        st.session_state._import_msg = (f"{file_key}: よやクル支払いリンク "
+                                        f"{n_add:,} 件を追加・{n_upd:,} 件の予約を入金済みに更新")
+        save_state()
+        _rebuild_cache()
+        st.rerun()
+
+
 MANUAL_COLS = ["利用日", "店舗", "顧客名", "売上", "手取り（振込額）", "決済方法"]
 
 _YMD_RE = re.compile(r"(\d{4})\s*[-/年.]\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})")
@@ -1549,6 +1713,10 @@ elif page == "📥 データ取込":
 
             if df_raw is None:
                 st.error("読み込み失敗：文字コードを確認してください。")
+                continue
+
+            if is_yoyakuru_link_csv(df_raw.columns.tolist()):
+                render_yoyakuru_link_import(df_raw, uploaded.name)
                 continue
 
             platform = detect_platform(df_raw.columns.tolist())
