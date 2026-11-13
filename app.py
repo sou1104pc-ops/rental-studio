@@ -13,6 +13,7 @@ import uuid
 from datetime import date, timedelta
 import occupancy as occ
 import card_expense as ce
+import bank_report
 
 # ─── ストレージ設定（Supabase優先、なければローカルJSON）─────────────────────
 DATA_DIR     = os.path.join(os.path.dirname(__file__), "data")
@@ -2918,6 +2919,31 @@ elif page == "📈 損益レポート":
             file_name=f"studio_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+    # ── 銀行提出用 PDF ──
+    st.divider()
+    st.subheader("🏦 銀行提出用 PDF")
+    st.caption("上の損益と同じ数字で、期間合計・店舗別・月別推移をまとめた報告書を作ります。")
+    pdf_months = sorted(total["月"].dropna().astype(str).unique())
+    if pdf_months:
+        # 年度の始まり（4月）があれば初期値にする
+        april = [m for m in pdf_months if m.endswith("-04")]
+        p_start, p_end = st.select_slider("対象期間", options=pdf_months,
+                                          value=(april[-1] if april else pdf_months[0], pdf_months[-1]),
+                                          key="bank_pdf_range")
+        p_company = st.text_input("事業者名（表紙に記載）", value=st.session_state.get("_tenant_name") or "",
+                                  key="bank_pdf_company")
+        pdf_notes = []
+        if pending_count:
+            pdf_notes.append(f"作成時点で入金確認待ちの銀行振込が {pending_count} 件あり、上記に含んでいません。")
+        if st.button("📄 PDFを作成", key="bank_pdf_build"):
+            st.session_state._bank_pdf = bank_report.build_pdf(
+                total, monthly, list(st.session_state.stores), p_start, p_end, p_company, pdf_notes)
+            st.session_state._bank_pdf_name = f"売上損益報告書_{p_start}_{p_end}.pdf"
+        if st.session_state.get("_bank_pdf"):
+            st.download_button("⬇️ PDFをダウンロード", data=st.session_state._bank_pdf,
+                               file_name=st.session_state._bank_pdf_name, mime="application/pdf",
+                               key="bank_pdf_dl")
 
 
 # ════════════════════════════════════════════════════════════════════════════
